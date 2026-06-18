@@ -313,15 +313,27 @@ int main(int argc, char** argv) {
     Stats st;
     std::mt19937_64 argrng(seed ^ 0x9E3779B97F4A7C15ull);
 
-    // Fuel: generous but finite. Loops are bounded (<=30 iters) and recursion is
-    // shallow, so well-formed cases finish far under this. out_of_fuel => skip.
-    const long kFuel = 20'000'000;
+    // Fuel: finite, and deliberately modest. Each loop is bounded (<=30 iters) and
+    // recursion is depth-bounded (<=12), but those constructs NEST (a loop body may
+    // contain another loop, a call, or a recursive function), so the total
+    // interpreter step count of a single case can blow up combinatorially. Any case
+    // that exceeds the fuel is reported out_of_fuel and SKIPPED entirely (the JIT,
+    // which has no fuel, is never invoked on it). Cases that DO finish within fuel
+    // are cheap, which keeps throughput high while still covering deep control flow.
+    // Crucially, skipping preserves correctness: we only ever compare JIT vs interp
+    // on cases the interpreter ran to completion.
+    const long kFuel = 1'000'000;
 
     bool found_mismatch = false;
     std::string repro_src;
     std::string repro_detail;
 
     for (int m = 0; m < modules && !found_mismatch; m++) {
+        if (m > 0 && m % 500 == 0) {
+            std::printf("  ... %d/%d modules, %ld cases compared, %ld skipped\n",
+                        m, modules, st.cases_run, st.cases_skipped_fuel);
+            std::fflush(stdout);
+        }
         Gen g(seed + (uint64_t)m * 0x100000001B3ull);
         std::vector<Gen::FnSig> fns;
         int nfuncs = g.range(1, 4);

@@ -39,6 +39,10 @@ private:
 };
 
 // Compile every function in the module. The returned module owns executable memory.
+// jit_compile      — simple, always-correct memory-backed codegen (the oracle baseline).
+// jit_compile_ra   — optimizing backend: instruction selection + liveness +
+//                    linear-scan register allocation (callee-saved homes, stack spills).
 JitModule jit_compile(World& w);
+JitModule jit_compile_ra(World& w);
 
 }  // namespace helix
