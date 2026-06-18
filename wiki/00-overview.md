@@ -148,6 +148,13 @@ Read top to bottom for the full argument; jump by interest using the description
 21. [21 — Worked Examples](21-worked-examples.md) — four complete source-to-silicon walkthroughs.
 22. [22 — Risks and Open Problems](22-risks-and-open-problems.md) — R1–R7 in depth plus the Helix-specific open problems.
 23. [23 — Glossary](23-glossary.md) — every Helix term, alphabetized and cross-linked.
+24. [24 — Implementation Status](24-implementation-status.md) — the **working C++ implementation**: design↔code map, validation evidence, honest gaps.
+
+> **There is a working implementation.** Helix is not only a design: the [`helix/`](../helix/) tree is a
+> dependency-free C++20 compiler that parses to the graph, optimizes, register-allocates,
+> and emits native x86-64 (JIT or COFF `.obj` → `.exe`), validated against an interpreter
+> oracle (55 tests / ~18.8k assertions + ~411k randomized differential checks). See
+> [Implementation Status](24-implementation-status.md).
 
 ---
 
