@@ -52,7 +52,7 @@ TEST("jit_ra: recursion, loops, mutual recursion all correct on real x64") {
     for (int n=0;n<=50;n++) CHECK_EQ(diff(c,"sum",{n}), (int64_t)n*(n-1)/2);
     CHECK_EQ(diff(c,"fact",{10}), 3628800);
     CHECK_EQ(diff(c,"gcd",{1071,462}), 21);
-    for (int n=0;n<=12;n++){ CHECK_EQ(diff(c,"is_even",{n}), n%2==0); CHECK_EQ(diff(c,"is_odd",{n}), n%2==1); }
+    for (int n=0;n<=12;n++){ CHECK_EQ(diff(c,"is_even",{n}), (int64_t)(n%2==0)); CHECK_EQ(diff(c,"is_odd",{n}), (int64_t)(n%2==1)); }
     CHECK_EQ(diff(c,"ack",{3,3}), 61);
     CHECK_EQ(diff(c,"collatz",{27}), 111);
 }

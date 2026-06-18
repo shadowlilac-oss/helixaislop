@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "helix/coff.hpp"
 #include "helix/ir.hpp"
 
 namespace helix {
@@ -44,5 +45,10 @@ private:
 //                    linear-scan register allocation (callee-saved homes, stack spills).
 JitModule jit_compile(World& w);
 JitModule jit_compile_ra(World& w);
+
+// Compile the module to a relocatable COFF object image (optimizing backend).
+// Each function becomes a defined symbol; cross-function calls become ADDR64
+// relocations. Link with link.exe to produce a real executable. Empty text on error.
+ObjModule compile_module_obj(World& w);
 
 }  // namespace helix

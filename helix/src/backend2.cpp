@@ -520,4 +520,50 @@ JitModule jit_compile_ra(World& w) {
     return mod;
 }
 
+ObjModule compile_module_obj(World& w) {
+    ObjModule obj;
+    std::vector<EncodedFn> outs;
+    std::unordered_map<NodeId, size_t> idx;
+    try {
+        for (NodeId f : w.module_funcs()) {
+            Lowerer lo(w, f);
+            lo.run();
+            Alloc al = allocate(lo.vf);
+            FnEncoder enc(lo.vf, al);
+            enc.run();
+            idx[f] = outs.size();
+            outs.push_back({f, std::move(enc.a.bytes()), std::move(enc.call_relocs)});
+        }
+    } catch (const CompileError&) {
+        return obj;  // empty text signals failure
+    }
+    std::vector<size_t> off(outs.size());
+    size_t total = 0;
+    for (size_t i = 0; i < outs.size(); i++) {
+        total = (total + 15) & ~size_t(15);
+        off[i] = total;
+        total += outs[i].code.size();
+    }
+    obj.text.assign(total, 0);
+    for (size_t i = 0; i < outs.size(); i++)
+        memcpy(obj.text.data() + off[i], outs[i].code.data(), outs[i].code.size());
+    for (NodeId f : w.module_funcs()) {
+        CoffSymbol s;
+        s.name = w.func_info(f).name;
+        s.offset = (uint32_t)off[idx[f]];
+        s.defined = true;
+        s.is_function = true;
+        obj.symbols.push_back(s);
+    }
+    for (size_t i = 0; i < outs.size(); i++)
+        for (auto& rel : outs[i].relocs) {
+            CoffReloc r;
+            r.offset = (uint32_t)(off[i] + rel.first);
+            r.target_symbol = w.func_info(rel.second).name;
+            r.type = 1;  // IMAGE_REL_AMD64_ADDR64 (mov rax, <abs callee>)
+            obj.relocs.push_back(r);
+        }
+    return obj;
+}
+
 }  // namespace helix

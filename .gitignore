@@ -3,4 +3,4 @@ helix/build/
 *.obj
 *.pdb
 *.ilk
-helix/scratch/
+helix/scratch*/

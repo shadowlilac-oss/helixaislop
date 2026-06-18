@@ -1,4 +1,0 @@
-Microsoft Windows [Version 10.0.22631.3155]
-(c) Microsoft Corporation. All rights reserved.
-
-E:\IRGraph\helix>
