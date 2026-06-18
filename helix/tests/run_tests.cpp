@@ -3,10 +3,12 @@
 int main() {
     int pass = 0, fail = 0;
     long checks_before_total = 0;
+    std::setvbuf(stdout, nullptr, _IONBF, 0);  // unbuffered: survive a crashing test
     std::printf("running %zu tests\n\n", ht::registry().size());
     for (auto& t : ht::registry()) {
         long before = ht::fail_count();
         long checks_before = ht::check_count();
+        std::printf("  .... %s\r", t.name);
         t.fn();
         long new_fails = ht::fail_count() - before;
         long new_checks = ht::check_count() - checks_before;
