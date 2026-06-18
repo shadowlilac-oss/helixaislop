@@ -83,6 +83,11 @@ public:
         emit(0x0F); emit(0xB6);
         emit((uint8_t)(0xC0 | ((dst & 7) << 3) | 0 /*al*/));
     }
+    void movsxd(Reg dst, Reg src) {  // movsxd dst, src32 : sign-extend low 32 bits to 64
+        rex(true, dst >= 8, src >= 8);
+        emit(0x63);
+        emit((uint8_t)(0xC0 | ((dst & 7) << 3) | (src & 7)));
+    }
     void cmovcc(CC cc, Reg dst, Reg src) {  // reg(dst) <- r/m(src) if cc
         rex(true, dst >= 8, src >= 8);
         emit(0x0F); emit((uint8_t)(0x40 + cc));

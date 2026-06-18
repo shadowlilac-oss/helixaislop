@@ -141,9 +141,9 @@ std::optional<int64_t> World::as_const(NodeId id) const {
 std::optional<int64_t> World::fold_binop(Op op, int64_t a, int64_t b, Type t, bool& ok) const {
     ok = true;
     switch (op) {
-        case Op::Add: return trunc(a + b, t);
-        case Op::Sub: return trunc(a - b, t);
-        case Op::Mul: return trunc(a * b, t);
+        case Op::Add: return trunc((int64_t)((uint64_t)a + (uint64_t)b), t);
+        case Op::Sub: return trunc((int64_t)((uint64_t)a - (uint64_t)b), t);
+        case Op::Mul: return trunc((int64_t)((uint64_t)a * (uint64_t)b), t);
         case Op::SDiv:
             if (b == 0) { ok = false; return std::nullopt; }  // div-by-zero: leave as node
             if (a == INT64_MIN && b == -1) return trunc(a, t);
@@ -256,7 +256,8 @@ NodeId World::cmp(Op op, NodeId a, NodeId b) {
 }
 
 NodeId World::neg(NodeId a) {
-    if (auto c = as_const(a)) return konst(trunc(-*c, nodes_[a].type), nodes_[a].type);
+    if (auto c = as_const(a))
+        return konst(trunc((int64_t)(0ull - (uint64_t)*c), nodes_[a].type), nodes_[a].type);
     Node n{Op::Neg, nodes_[a].type, {a}, NONE, 0, 0};
     return intern(std::move(n));
 }
@@ -316,6 +317,7 @@ void World::end_func(NodeId func, NodeId result, NodeId state_result) {
 NodeId World::make_cond(NodeId predicate, Type result_type, std::vector<NodeId> yields) {
     // Fully-static predicate => pick the branch (Tier-1 reduction of control).
     if (auto cp = as_const(predicate)) {
+        if (yields.size() == 2) return *cp ? yields[1] : yields[0];  // binary: truthiness
         int64_t idx = *cp;
         if (idx >= 0 && idx < (int64_t)yields.size()) return yields[idx];
     }
@@ -323,8 +325,10 @@ NodeId World::make_cond(NodeId predicate, Type result_type, std::vector<NodeId> 
     if (yields.size() == 2) {
         if (yields[0] == yields[1]) return yields[0];  // both arms equal
         auto y0 = as_const(yields[0]), y1 = as_const(yields[1]);
-        // cond(p, {false, true}) == p  ;  cond(p, {true, false}) == !p
-        if (result_type.kind == TyKind::Bool && y0 && y1) {
+        // cond(p, {false, true}) == p ; cond(p, {true, false}) == !p — only valid when the
+        // predicate is a proven bool (in {0,1}); otherwise truthiness != identity.
+        const bool pred_bool = node(predicate).type.kind == TyKind::Bool;
+        if (result_type.kind == TyKind::Bool && y0 && y1 && pred_bool) {
             if (*y0 == 0 && *y1 == 1) return predicate;
             if (*y0 == 1 && *y1 == 0) return cmp(Op::CmpEq, predicate, konst_bool(false));
         }

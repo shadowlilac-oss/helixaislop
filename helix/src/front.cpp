@@ -317,9 +317,16 @@ struct Parser {
         return body;
     }
 
+    // Coerce a value to a canonical bool (0/1) so Cond predicates are always in
+    // {0,1} and truthiness == index everywhere (interp, folder, backend agree).
+    NodeId to_bool(NodeId c) {
+        if (w.node(c).type.kind == TyKind::Bool) return c;
+        return w.cmp(Op::CmpNe, c, w.konst(0, w.node(c).type));
+    }
+
     NodeId parse_if() {
         expect(Tok::KwIf, "if");
-        NodeId c = parse_expr(0);
+        NodeId c = to_bool(parse_expr(0));
         expect(Tok::LBrace, "{");
         NodeId then_v = parse_expr(0);
         expect(Tok::RBrace, "}");
@@ -349,8 +356,14 @@ struct Parser {
         auto it = funcs.find(name);
         if (it == funcs.end()) err("call to unknown function '" + name + "'");
         NodeId target = it->second->node;
+        if (args.size() != it->second->param_types.size())
+            err("call to '" + name + "' expects " +
+                std::to_string(it->second->param_types.size()) + " argument(s), got " +
+                std::to_string(args.size()));
         // comptime evaluation as graph reduction: fold a comptime call on constant args.
-        if (it->second->is_comptime) {
+        // Only when the callee body is finalized (result != NONE) — never fold against
+        // an unparsed forward-declared body (which would silently yield 0).
+        if (it->second->is_comptime && w.func_info(target).result != NONE) {
             bool all_const = true;
             std::vector<int64_t> cargs;
             for (NodeId a : args) {
@@ -425,7 +438,7 @@ struct Parser {
             return s;
         }
         if (accept(Tok::KwIf)) {
-            NodeId c = parse_expr(0);
+            NodeId c = to_bool(parse_expr(0));
             expect(Tok::LBrace, "{");
             Step then_s = parse_step(carried);
             expect(Tok::RBrace, "}");
@@ -456,7 +469,10 @@ struct Parser {
             w.add_func(h.node);
         }
         for (auto& h : headers) funcs[h.name] = &h;
-        for (auto& h : headers) parse_body(h);
+        // Parse comptime function bodies first so their results are finalized before
+        // any (constant-arg) comptime call site is folded.
+        for (auto& h : headers) if (h.is_comptime) parse_body(h);
+        for (auto& h : headers) if (!h.is_comptime) parse_body(h);
     }
 };
 

@@ -55,7 +55,7 @@ struct Interp {
                 result = arith(n.op, a, b, n.type);
                 break;
             }
-            case Op::Neg: result = trunc(-eval(n.ins[0], fr), n.type); break;
+            case Op::Neg: result = trunc((int64_t)(0ull - (uint64_t)eval(n.ins[0], fr)), n.type); break;
             case Op::Not: result = trunc(~eval(n.ins[0], fr), n.type); break;
             case Op::CmpEq: case Op::CmpNe: case Op::CmpLt: case Op::CmpLe:
             case Op::CmpGt: case Op::CmpGe: {
@@ -71,8 +71,13 @@ struct Interp {
             case Op::Cond: {
                 int64_t p = eval(n.ins[0], fr);
                 const CondInfo& ci = w.cond_info(id);
-                if (p < 0 || p >= (int64_t)ci.yields.size()) { result = 0; break; }
-                result = eval(ci.yields[(size_t)p], fr);  // only the taken branch
+                if (ci.yields.size() == 2) {  // binary cond: truthiness (matches backend/folder)
+                    result = eval(ci.yields[p ? 1 : 0], fr);
+                } else if (p < 0 || p >= (int64_t)ci.yields.size()) {
+                    result = 0;
+                } else {
+                    result = eval(ci.yields[(size_t)p], fr);  // n-ary: case index
+                }
                 break;
             }
             case Op::Loop:
@@ -129,6 +134,7 @@ struct Interp {
     int64_t run(NodeId func, const std::vector<int64_t>& args) {
         if (!spend()) return 0;  // bound recursion depth/count
         const FuncInfo& fi = w.func_info(func);
+        if (fi.result == NONE) { out_of_fuel = true; return 0; }  // unfinalized body: error, not 0
         Frame fr;
         for (size_t i = 0; i < fi.params.size() && i < args.size(); i++)
             fr.bind[fi.params[i]] = trunc(args[i], fi.param_types[i]);
@@ -147,9 +153,9 @@ struct Interp {
 
     int64_t arith(Op op, int64_t a, int64_t b, Type t) const {
         switch (op) {
-            case Op::Add: return trunc(a + b, t);
-            case Op::Sub: return trunc(a - b, t);
-            case Op::Mul: return trunc(a * b, t);
+            case Op::Add: return trunc((int64_t)((uint64_t)a + (uint64_t)b), t);
+            case Op::Sub: return trunc((int64_t)((uint64_t)a - (uint64_t)b), t);
+            case Op::Mul: return trunc((int64_t)((uint64_t)a * (uint64_t)b), t);
             case Op::SDiv:
                 if (b == 0) return 0;  // div-by-zero: defined as 0 in the reference
                 if (a == INT64_MIN && b == -1) return trunc(a, t);

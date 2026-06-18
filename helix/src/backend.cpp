@@ -41,6 +41,12 @@ struct FuncGen {
     }
     int32_t anon_slot() { return -8 * (++slot_count); }
 
+    // Sign-extend a narrow integer result in `r` to its declared width (so i32
+    // wraps like the interpreter's trunc()). i64/bool need no fixup.
+    void narrow(Reg r, Type t) {
+        if (t.kind == TyKind::Int && t.bits == 32) a.movsxd(r, r);
+    }
+
     void run() {
         const FuncInfo& fi = w.func_info(func);
         if (fi.params.size() > 4) throw CompileError{"more than 4 params unsupported"};
@@ -50,8 +56,10 @@ struct FuncGen {
         a.sub_rsp(0);  // placeholder; patched after we know slot_count
         sub_rsp_imm_pos = a.size() - 4;
 
-        // store incoming arg registers into param slots
+        // store incoming arg registers into param slots (sign-extending narrow ints)
         for (size_t i = 0; i < fi.params.size(); i++) {
+            if (fi.param_types[i].kind == TyKind::Int && fi.param_types[i].bits == 32)
+                a.movsxd(kArgRegs[i], kArgRegs[i]);
             a.store(slot(fi.params[i]), kArgRegs[i]);
             computed_.insert(fi.params[i]);
         }
@@ -91,26 +99,41 @@ struct FuncGen {
             case Op::Mul: {
                 emit_value(n.ins[0]); emit_value(n.ins[1]);
                 a.load(RAX, slot(n.ins[0])); a.load(RCX, slot(n.ins[1]));
-                a.imul(RAX, RCX); a.store(slot(v), RAX);
+                a.imul(RAX, RCX); narrow(RAX, n.type); a.store(slot(v), RAX);
                 break;
             }
             case Op::SDiv: case Op::SRem: {
                 emit_value(n.ins[0]); emit_value(n.ins[1]);
-                a.load(RAX, slot(n.ins[0]));
-                a.cqo();
-                a.load(RCX, slot(n.ins[1]));
-                a.idiv(RCX);
-                a.store(slot(v), n.op == Op::SDiv ? RAX : RDX);
+                a.load(RAX, slot(n.ins[0]));   // dividend
+                a.load(RCX, slot(n.ins[1]));   // divisor
+                Label Lzero = a.new_label(), Lovf = a.new_label(), Ldiv = a.new_label(), Ldone = a.new_label();
+                a.test_rr(RCX, RCX);
+                a.jcc(CC_E, Lzero);            // divisor == 0 -> result 0 (matches interpreter)
+                a.mov_ri(RDX, -1); a.alu(Alu::Cmp, RCX, RDX); a.jcc(CC_NE, Ldiv);
+                a.mov_ri(RDX, INT64_MIN); a.alu(Alu::Cmp, RAX, RDX); a.jcc(CC_NE, Ldiv);
+                a.jmp(Lovf);                   // INT64_MIN / -1 -> overflow (would trap #DE)
+                a.bind(Ldiv);
+                a.cqo(); a.idiv(RCX);
+                { Reg r = (n.op == Op::SDiv) ? RAX : RDX; if (r != RAX) a.mov_rr(RAX, r); }
+                narrow(RAX, n.type); a.store(slot(v), RAX); a.jmp(Ldone);
+                a.bind(Lzero);
+                a.mov_ri(RAX, 0); a.store(slot(v), RAX); a.jmp(Ldone);
+                a.bind(Lovf);
+                if (n.op == Op::SDiv) { narrow(RAX, n.type); a.store(slot(v), RAX); }  // RAX = INT64_MIN
+                else { a.mov_ri(RAX, 0); a.store(slot(v), RAX); }
+                a.bind(Ldone);
                 break;
             }
             case Op::Shl: bin_shift(v, Shift::Shl); break;
             case Op::AShr: bin_shift(v, Shift::Sar); break;
             case Op::LShr: bin_shift(v, Shift::Shr); break;
             case Op::Neg:
-                emit_value(n.ins[0]); a.load(RAX, slot(n.ins[0])); a.neg(RAX); a.store(slot(v), RAX);
+                emit_value(n.ins[0]); a.load(RAX, slot(n.ins[0])); a.neg(RAX);
+                narrow(RAX, n.type); a.store(slot(v), RAX);
                 break;
             case Op::Not:
-                emit_value(n.ins[0]); a.load(RAX, slot(n.ins[0])); a.not_(RAX); a.store(slot(v), RAX);
+                emit_value(n.ins[0]); a.load(RAX, slot(n.ins[0])); a.not_(RAX);
+                narrow(RAX, n.type); a.store(slot(v), RAX);
                 break;
             case Op::CmpEq: cmp(v, CC_E); break;
             case Op::CmpNe: cmp(v, CC_NE); break;
@@ -143,6 +166,7 @@ struct FuncGen {
         a.load(RAX, slot(n.ins[0]));
         a.load(RCX, slot(n.ins[1]));
         a.alu(k, RAX, RCX);
+        narrow(RAX, n.type);
         a.store(slot(v), RAX);
     }
     void bin_shift(NodeId v, Shift k) {
@@ -151,6 +175,7 @@ struct FuncGen {
         a.load(RAX, slot(n.ins[0]));
         a.load(RCX, slot(n.ins[1]));  // count in CL
         a.shift(k, RAX);
+        narrow(RAX, n.type);
         a.store(slot(v), RAX);
     }
     void cmp(NodeId v, CC cc) {
