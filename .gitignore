@@ -1,0 +1,6 @@
+helix/build/
+*.exe
+*.obj
+*.pdb
+*.ilk
+helix/scratch/
