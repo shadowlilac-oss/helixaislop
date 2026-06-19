@@ -103,3 +103,15 @@ TEST("imperative: while over an array (mutable accumulator + loads)") {
         CHECK_EQ(diff(c, "amax", {addr, n}), rm);
     }
 }
+
+TEST("imperative: while condition containing braces parses correctly (regression BUG4)") {
+    C c;
+    load(c, "fn f(n: int) -> int { var i = 0; while if i < n { 1 } else { 0 } { i = i + 1; } return i; }\n");
+    for (int n = 0; n <= 10; n++) CHECK_EQ(diff(c, "f", {n}), n);
+}
+
+TEST("imperative: body-local var does not hijack an outer var (regression BUG5)") {
+    C c;
+    load(c, "fn f(n: int) -> int { var x = 100; var i = 0; while i < n { var x = i; x = x + 1; i = i + 1; } return x; }\n");
+    for (int n = 0; n <= 10; n++) CHECK_EQ(diff(c, "f", {n}), 100);  // outer x stays 100
+}

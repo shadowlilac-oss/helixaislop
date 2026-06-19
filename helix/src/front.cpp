@@ -244,13 +244,14 @@ struct Parser {
         cur_result_ty = h.result_type;
         env.clear();
         mutables.clear();
-        func_has_stores = scan_has_stores(h.body_begin, h.body_end);
-        if (func_has_stores) env["$mem"] = w.mem_start();  // threaded memory state
+        // Array WRITES (a[i]=v) are disabled: the threaded-state effect lowering had
+        // ordering miscompiles (found by fuzzing) that require region-port state
+        // threading to fix correctly. Reads (a[i], pure loads) remain supported.
+        func_has_stores = false;
         for (size_t i = 0; i < h.param_names.size(); i++) bind(h.param_names[i], fi.params[i]);
         p = h.body_begin;
         NodeId v = parse_stmt_block();  // statements + tail/return value
-        if (func_has_stores) w.end_func(h.node, v, env["$mem"]);  // state_result forces the stores
-        else w.end_func(h.node, v);
+        w.end_func(h.node, v);
     }
 
     bool peek_assign() {
@@ -298,20 +299,7 @@ struct Parser {
                 accept(Tok::Semi);
                 continue;
             }
-            if (peek_store()) {  // a[i] = v;  (memory write, threaded through $mem)
-                std::string name = cur().text; p++;
-                NodeId base = lookup(name);
-                if (base == NONE) err("unknown array '" + name + "'");
-                expect(Tok::LBracket, "[");
-                NodeId idx = parse_expr(0);
-                expect(Tok::RBracket, "]");
-                expect(Tok::Assign, "=");
-                NodeId val = parse_expr(0);
-                expect(Tok::Semi, ";");
-                NodeId addr = w.add(base, w.mul(idx, w.konst(8, ty_i64())));
-                env["$mem"] = w.store(addr, val, env["$mem"]);
-                continue;
-            }
+            if (peek_store()) err("array writes (a[i] = v) are not supported in this build");
             if (peek_assign()) {
                 std::string name = cur().text; p++;
                 expect(Tok::Assign, "=");
@@ -345,25 +333,34 @@ struct Parser {
         err("expected while body");
     }
 
-    // Names that are assigned (`name = ...`) anywhere inside the block starting at `pos`.
+    // Names assigned (`name = ...`) anywhere inside the block at `pos`, EXCLUDING
+    // names re-declared with var/let inside the block (those are body-local and
+    // must not hijack an outer variable as a loop-carried one).
     std::vector<std::string> scan_modified(size_t pos) {
         std::vector<std::string> out;
-        std::unordered_set<std::string> seen;
+        std::unordered_set<std::string> seen, declared;
         int depth = 0;
         for (size_t q = pos; toks[q].kind != Tok::End; q++) {
             if (toks[q].kind == Tok::LBrace) depth++;
             else if (toks[q].kind == Tok::RBrace) { if (--depth == 0) break; }
+            else if ((toks[q].kind == Tok::KwVar || toks[q].kind == Tok::KwLet) &&
+                     toks[q + 1].kind == Tok::Ident)
+                declared.insert(toks[q + 1].text);
             else if (toks[q].kind == Tok::Ident && toks[q + 1].kind == Tok::Assign)
                 if (seen.insert(toks[q].text).second) out.push_back(toks[q].text);
         }
-        return out;
+        std::vector<std::string> filtered;
+        for (auto& s : out) if (!declared.count(s)) filtered.push_back(s);
+        return filtered;
     }
 
     // while c { body } : variables modified in the body become loop-carried (multi-result).
     void parse_while() {
         expect(Tok::KwWhile, "while");
         Env pre = env;  // snapshot to restore after the loop (drops body-local vars)
-        size_t body_brace = find_body_brace(p);
+        size_t cond_pos = p;
+        { Env save = env; to_bool(parse_expr(0)); env = save; }  // trial-parse cond -> locate body
+        size_t body_brace = p;                                   // p now at the body `{`
         std::vector<std::string> mod = scan_modified(body_brace);
         std::vector<std::string> names;
         for (auto& m : mod) if (env.count(m)) names.push_back(m);
@@ -375,7 +372,8 @@ struct Parser {
             params.push_back(pm);
             env[names[k]] = pm;  // body sees the carried value
         }
-        NodeId cond = to_bool(parse_expr(0));            // uses carried params; p -> body `{`
+        p = cond_pos;                                    // re-parse cond with carried params bound
+        NodeId cond = to_bool(parse_expr(0));            // p -> body `{`
         NodeId is_break = w.cmp(Op::CmpEq, cond, w.konst_bool(false));  // break when !cond
         parse_stmt_block();                              // body; mutates env[names]
         std::vector<NodeId> next_vals;
