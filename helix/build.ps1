@@ -3,8 +3,9 @@
 param([switch]$NoRun, [switch]$Cli)
 
 $ErrorActionPreference = 'Stop'
-$root = 'E:\IRGraph\helix'
-$vc = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+$root = $PSScriptRoot
+. "$root\find-vcvars.ps1"
+$vc = Find-VcVars
 
 $srcFiles = (Get-ChildItem "$root\src\*.cpp" | ForEach-Object { '"' + $_.FullName + '"' }) -join ' '
 New-Item -ItemType Directory -Force "$root\build" | Out-Null

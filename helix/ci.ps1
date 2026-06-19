@@ -4,10 +4,8 @@
 # CI (see ../.github/workflows/ci.yml) goes red. Run locally with: ./ci.ps1
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
-$vc = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-if (-not (Test-Path $vc)) {
-    $vc = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"  # GH runner
-}
+. "$root\find-vcvars.ps1"
+$vc = Find-VcVars  # locate VS dynamically (any edition / GitHub runner); no hardcoded path
 
 # 1. Unit suite (also compiles every src file; the verifier runs in-codegen in debug builds).
 Write-Host "==> unit tests" -ForegroundColor Cyan
