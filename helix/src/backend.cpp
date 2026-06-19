@@ -67,6 +67,7 @@ struct FuncGen {
         }
 
         emit_value(fi.result);
+        if (fi.state_result != NONE) emit_value(fi.state_result);  // emit pending memory writes
         a.load(RAX, slot(fi.result));
         a.mov_rsp_rbp();
         a.pop_rbp();
@@ -173,12 +174,21 @@ struct FuncGen {
                 break;
             }
             case Op::Call: emit_call(v); break;
-            case Op::Load:  // read-only memory load: RAX = *address
+            case Op::Load:  // memory load: RAX = *address (force prior writes first)
+                if (n.state_in != NONE) emit_value(n.state_in);
                 emit_value(n.ins[0]);
                 a.load(RAX, slot(n.ins[0]));
                 a.mov_from_mem(RAX, RAX);
                 narrow(RAX, n.type);
                 a.store(slot(v), RAX);
+                break;
+            case Op::Store:  // *address = value, ordered after prior effects
+                emit_value(n.state_in);
+                emit_value(n.ins[0]);
+                emit_value(n.ins[1]);
+                a.load(RAX, slot(n.ins[0]));
+                a.load(RCX, slot(n.ins[1]));
+                a.mov_to_mem(RAX, RCX);
                 break;
             default:
                 throw CompileError{std::string("cannot lower op ") + op_name(n.op)};

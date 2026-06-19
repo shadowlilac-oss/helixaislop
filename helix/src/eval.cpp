@@ -40,8 +40,10 @@ struct Interp {
         }
 
         // memoize pure structural nodes within the current (fixed-binding) frame
-        const bool memoizable = (n.state_in == NONE) &&
-                                (n.op >= Op::Add && n.op <= Op::Select);
+        // Pure arith memoizes within a fixed binding; Load/Store memoize so each
+        // executes EXACTLY ONCE per iteration (their state forcing handles ordering).
+        const bool memoizable = n.op == Op::Load || n.op == Op::Store ||
+                                ((n.state_in == NONE) && (n.op >= Op::Add && n.op <= Op::Select));
         if (memoizable) {
             auto it = fr.memo.find(id);
             if (it != fr.memo.end()) return it->second;
@@ -87,9 +89,18 @@ struct Interp {
             case Op::Call:
                 result = eval_call(id, fr);
                 break;
-            case Op::Load: {  // read-only load via a real pointer
+            case Op::Load: {  // memory load (force prior writes if state-threaded)
+                if (n.state_in != NONE) eval(n.state_in, fr);
                 int64_t addr = eval(n.ins[0], fr);
                 result = *reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(addr));
+                break;
+            }
+            case Op::Store: {  // *(i64*)addr = val ; force prior effects first
+                eval(n.state_in, fr);
+                int64_t addr = eval(n.ins[0], fr);
+                int64_t val = eval(n.ins[1], fr);
+                *reinterpret_cast<int64_t*>(static_cast<uintptr_t>(addr)) = val;
+                result = 0;  // phantom state token
                 break;
             }
             case Op::Proj: {  // idx-th result of a multi-result loop (run once, cached)
@@ -185,7 +196,9 @@ struct Interp {
         Frame fr;
         for (size_t i = 0; i < fi.params.size() && i < args.size(); i++)
             fr.bind[fi.params[i]] = trunc(args[i], fi.param_types[i]);
-        return eval(fi.result, fr);
+        int64_t rv = eval(fi.result, fr);
+        if (fi.state_result != NONE) eval(fi.state_result, fr);  // force all memory writes
+        return rv;
     }
 
     int64_t trunc(int64_t v, Type t) const {

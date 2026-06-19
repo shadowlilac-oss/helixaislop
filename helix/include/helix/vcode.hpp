@@ -23,7 +23,8 @@ enum class MOp : uint8_t {
     Neg, Not,                                              // dst = OP a
     SetCmp,   // dst = (a cc b) ? 1 : 0
     Sel,      // dst = c ? a : b
-    Load,     // dst = *(i64*)a   (read-only memory load)
+    Load,     // dst = *(i64*)a   (memory load)
+    Store,    // *(i64*)a = b     (memory store)
     Call,     // dst = call imm(args...)
     // terminators (always last in a block)
     Ret,      // return a

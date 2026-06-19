@@ -66,6 +66,7 @@ struct Lowerer {
             emit(m);
         }
         VReg r = lower(fi.result);
+        if (fi.state_result != NONE) lower(fi.state_result);  // emit pending memory writes
         MInst ret; ret.op = MOp::Ret; ret.a = r; emit(ret);
     }
 
@@ -128,9 +129,18 @@ struct Lowerer {
             }
             case Op::Call: r = lower_call(v); break;
             case Op::Load: {
+                if (n.state_in != NONE) lower(n.state_in);  // force prior writes (ordering)
                 VReg addr = lower(n.ins[0]);
                 r = fresh();
                 MInst m; m.op = MOp::Load; m.dst = r; m.a = addr; m.type = n.type; emit(m);
+                break;
+            }
+            case Op::Store: {
+                lower(n.state_in);                   // force prior effects, in order
+                VReg addr = lower(n.ins[0]);
+                VReg val = lower(n.ins[1]);
+                MInst m; m.op = MOp::Store; m.a = addr; m.b = val; emit(m);
+                r = fresh();                         // phantom state token
                 break;
             }
             default: throw CompileError{std::string("cannot lower ") + op_name(n.op)};
@@ -287,6 +297,7 @@ void operands(const MInst& in, std::vector<VReg>& uses, VReg& def) {
         case MOp::Shr: case MOp::SetCmp:
             uses = {in.a, in.b}; def = in.dst; break;
         case MOp::Neg: case MOp::Not: case MOp::Load: uses = {in.a}; def = in.dst; break;
+        case MOp::Store: uses = {in.a, in.b}; break;  // writes memory, no vreg def
         case MOp::Sel: uses = {in.a, in.b, in.c}; def = in.dst; break;
         case MOp::Call: uses = in.args; def = in.dst; break;
         case MOp::Ret: uses = {in.a}; break;
@@ -514,6 +525,12 @@ struct FnEncoder {
                 a.mov_from_mem(t, RAX);     // t = *address
                 narrow(t, in.type);
                 if (!d.inreg) a.store(d.disp, t);
+                break;
+            }
+            case MOp::Store: {
+                get(in.a, RAX);            // address
+                get(in.b, RCX);            // value
+                a.mov_to_mem(RAX, RCX);    // *address = value
                 break;
             }
             case MOp::Call: encode_call(in); break;

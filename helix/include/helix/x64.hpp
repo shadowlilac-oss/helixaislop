@@ -112,6 +112,11 @@ public:
         emit(0x8B);
         emit((uint8_t)(((dst & 7) << 3) | (base & 7)));  // mod=00
     }
+    void mov_to_mem(Reg base, Reg src) {  // mov [base], src  (base must not be rbp/rsp/r12/r13)
+        rex(true, src >= 8, base >= 8);
+        emit(0x89);
+        emit((uint8_t)(((src & 7) << 3) | (base & 7)));  // mod=00
+    }
     void cmovcc(CC cc, Reg dst, Reg src) {  // reg(dst) <- r/m(src) if cc
         rex(true, dst >= 8, src >= 8);
         emit(0x0F); emit((uint8_t)(0x40 + cc));

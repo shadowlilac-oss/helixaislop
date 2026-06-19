@@ -292,6 +292,11 @@ NodeId World::pure_load(NodeId ptr, Type t) {
     return intern(std::move(n));  // read-only: loads of the same address are the same node
 }
 
+NodeId World::mem_start() {
+    Node n{Op::ConstInt, ty_state(), {}, NONE, 0, 0};  // phantom root memory state
+    return intern(std::move(n));
+}
+
 NodeId World::param(Type t, int index, std::string name) {
     Node n{Op::Param, t, {}, NONE, index, 0};
     return fresh(std::move(n), std::move(name));

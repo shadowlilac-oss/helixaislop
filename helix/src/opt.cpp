@@ -80,7 +80,7 @@ struct Cloner {
                 for (NodeId a : n.ins) args.push_back(clone(a, map, depth));
                 NodeId target = (NodeId)n.imm;
                 const FuncInfo tfi = w.func_info(target);  // copy
-                if (depth > 0 && tfi.result != NONE && !tfi.has_state) {
+                if (depth > 0 && tfi.result != NONE && !tfi.has_state && tfi.state_result == NONE) {
                     // inline: clone the callee body with its params bound to args
                     std::unordered_map<NodeId, NodeId> sub;
                     for (size_t i = 0; i < tfi.params.size() && i < args.size(); i++)
@@ -107,7 +107,7 @@ NodeId inline_call(World& w, NodeId call_node, int depth) {
     if (n.op != Op::Call) return call_node;
     NodeId target = (NodeId)n.imm;
     const FuncInfo& tfi = w.func_info(target);
-    if (tfi.result == NONE || tfi.has_state) return call_node;
+    if (tfi.result == NONE || tfi.has_state || tfi.state_result != NONE) return call_node;
     Cloner c(w);
     std::unordered_map<NodeId, NodeId> sub;
     for (size_t i = 0; i < tfi.params.size() && i < n.ins.size(); i++)

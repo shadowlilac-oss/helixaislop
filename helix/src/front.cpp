@@ -159,6 +159,7 @@ struct Parser {
     std::unordered_map<std::string, FuncHeader*> funcs;
     std::unordered_map<std::string, NodeId> env;        // current value of each variable (SSA)
     std::unordered_set<std::string> mutables;           // names declared with `var`
+    bool func_has_stores = false;                       // current fn writes memory -> thread $mem
     Type cur_result_ty = ty_i64();
     using Env = std::unordered_map<std::string, NodeId>;
 
@@ -222,19 +223,49 @@ struct Parser {
     }
 
     // ---- pass 2: bodies ----
+    // Does the token range contain an array store `IDENT [ ... ] = ` ?
+    bool scan_has_stores(size_t begin, size_t end) {
+        for (size_t q = begin; q < end; q++) {
+            if (toks[q].kind == Tok::Ident && q + 1 < toks.size() && toks[q + 1].kind == Tok::LBracket) {
+                int depth = 0;
+                for (size_t r = q + 1; r <= end && toks[r].kind != Tok::End; r++) {
+                    if (toks[r].kind == Tok::LBracket) depth++;
+                    else if (toks[r].kind == Tok::RBracket) {
+                        if (--depth == 0) { if (toks[r + 1].kind == Tok::Assign) return true; break; }
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
     void parse_body(FuncHeader& h) {
         FuncInfo& fi = w.func_info(h.node);
         cur_result_ty = h.result_type;
         env.clear();
         mutables.clear();
+        func_has_stores = scan_has_stores(h.body_begin, h.body_end);
+        if (func_has_stores) env["$mem"] = w.mem_start();  // threaded memory state
         for (size_t i = 0; i < h.param_names.size(); i++) bind(h.param_names[i], fi.params[i]);
         p = h.body_begin;
         NodeId v = parse_stmt_block();  // statements + tail/return value
-        w.end_func(h.node, v);
+        if (func_has_stores) w.end_func(h.node, v, env["$mem"]);  // state_result forces the stores
+        else w.end_func(h.node, v);
     }
 
     bool peek_assign() {
         return is(Tok::Ident) && p + 1 < toks.size() && toks[p + 1].kind == Tok::Assign;
+    }
+
+    // `IDENT [ ... ] = ` at the current position?
+    bool peek_store() {
+        if (!is(Tok::Ident) || p + 1 >= toks.size() || toks[p + 1].kind != Tok::LBracket) return false;
+        int depth = 0;
+        for (size_t q = p + 1; toks[q].kind != Tok::End; q++) {
+            if (toks[q].kind == Tok::LBracket) depth++;
+            else if (toks[q].kind == Tok::RBracket) { if (--depth == 0) return toks[q + 1].kind == Tok::Assign; }
+        }
+        return false;
     }
 
     // Parse a `{ stmt* tail? }` block; returns the tail (or `return`) value, NONE if void.
@@ -265,6 +296,20 @@ struct Parser {
                 NodeId e = parse_loop();
                 if (is(Tok::RBrace)) { tail = e; break; }
                 accept(Tok::Semi);
+                continue;
+            }
+            if (peek_store()) {  // a[i] = v;  (memory write, threaded through $mem)
+                std::string name = cur().text; p++;
+                NodeId base = lookup(name);
+                if (base == NONE) err("unknown array '" + name + "'");
+                expect(Tok::LBracket, "[");
+                NodeId idx = parse_expr(0);
+                expect(Tok::RBracket, "]");
+                expect(Tok::Assign, "=");
+                NodeId val = parse_expr(0);
+                expect(Tok::Semi, ";");
+                NodeId addr = w.add(base, w.mul(idx, w.konst(8, ty_i64())));
+                env["$mem"] = w.store(addr, val, env["$mem"]);
                 continue;
             }
             if (peek_assign()) {
@@ -322,6 +367,7 @@ struct Parser {
         std::vector<std::string> mod = scan_modified(body_brace);
         std::vector<std::string> names;
         for (auto& m : mod) if (env.count(m)) names.push_back(m);
+        if (func_has_stores && env.count("$mem")) names.push_back("$mem");  // carry memory state
         std::vector<NodeId> inits, params;
         for (auto& nm : names) inits.push_back(env[nm]);
         for (size_t k = 0; k < names.size(); k++) {
@@ -395,10 +441,17 @@ struct Parser {
         if (accept(Tok::Minus)) return w.neg(parse_unary());
         if (accept(Tok::Bang)) return w.cmp(Op::CmpEq, parse_unary(), w.konst_bool(false));
         NodeId v = parse_primary();
-        while (accept(Tok::LBracket)) {  // a[i] = *(a + i*8), a read-only i64 load
+        while (accept(Tok::LBracket)) {  // a[i] : load at a + i*8
             NodeId idx = parse_expr(0);
             expect(Tok::RBracket, "]");
-            v = w.pure_load(w.add(v, w.mul(idx, w.konst(8, ty_i64()))), ty_i64());
+            NodeId addr = w.add(v, w.mul(idx, w.konst(8, ty_i64())));
+            if (func_has_stores) {  // effectful load (ordered after prior writes via $mem)
+                NodeId l = w.load(addr, env["$mem"], ty_i64());
+                env["$mem"] = l;
+                v = l;
+            } else {
+                v = w.pure_load(addr, ty_i64());  // read-only: CSE'd
+            }
         }
         return v;
     }

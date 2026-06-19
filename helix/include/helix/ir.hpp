@@ -138,6 +138,8 @@ public:
     // read-only load (no state token): pure, hash-consed (loads of the same address
     // CSE). Sound for memory that does not change during the call (e.g. input arrays).
     NodeId pure_load(NodeId ptr, Type t);
+    // The root (initial) memory state token for a function that performs writes.
+    NodeId mem_start();
 
     // params and regions
     NodeId param(Type t, int index, std::string name = "");
