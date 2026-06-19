@@ -2,6 +2,7 @@
 
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "helix/eval.hpp"
@@ -12,8 +13,8 @@ namespace {
 // ------------------------------- Lexer -------------------------------------
 enum class Tok {
     End, Ident, Int,
-    KwFn, KwComptime, KwLet, KwIf, KwElse, KwLoop, KwBreak, KwNext, KwTrue, KwFalse,
-    KwIntTy, KwI64, KwI32, KwBool,
+    KwFn, KwComptime, KwLet, KwVar, KwIf, KwElse, KwLoop, KwWhile, KwBreak, KwNext, KwReturn,
+    KwTrue, KwFalse, KwIntTy, KwI64, KwI32, KwBool,
     LParen, RParen, LBrace, RBrace, LBracket, RBracket, Comma, Semi, Colon, Arrow, Assign,
     Plus, Minus, Star, Slash, Percent,
     Amp, Pipe, Caret, Shl, Shr,
@@ -68,11 +69,14 @@ struct Lexer {
         if (t == "fn") k = Tok::KwFn;
         else if (t == "comptime") k = Tok::KwComptime;
         else if (t == "let") k = Tok::KwLet;
+        else if (t == "var") k = Tok::KwVar;
         else if (t == "if") k = Tok::KwIf;
         else if (t == "else") k = Tok::KwElse;
         else if (t == "loop") k = Tok::KwLoop;
+        else if (t == "while") k = Tok::KwWhile;
         else if (t == "break") k = Tok::KwBreak;
         else if (t == "next") k = Tok::KwNext;
+        else if (t == "return") k = Tok::KwReturn;
         else if (t == "true") k = Tok::KwTrue;
         else if (t == "false") k = Tok::KwFalse;
         else if (t == "int") k = Tok::KwIntTy;
@@ -153,8 +157,10 @@ struct Parser {
     std::vector<Token> toks;
     size_t p = 0;
     std::unordered_map<std::string, FuncHeader*> funcs;
-    std::vector<std::unordered_map<std::string, NodeId>> scopes;
+    std::unordered_map<std::string, NodeId> env;        // current value of each variable (SSA)
+    std::unordered_set<std::string> mutables;           // names declared with `var`
     Type cur_result_ty = ty_i64();
+    using Env = std::unordered_map<std::string, NodeId>;
 
     explicit Parser(World& world) : w(world) {}
 
@@ -174,15 +180,10 @@ struct Parser {
         err("expected type");
     }
 
-    void scope_push() { scopes.emplace_back(); }
-    void scope_pop() { scopes.pop_back(); }
-    void bind(const std::string& n, NodeId v) { scopes.back()[n] = v; }
+    void bind(const std::string& n, NodeId v) { env[n] = v; }
     NodeId lookup(const std::string& n) {
-        for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
-            auto f = it->find(n);
-            if (f != it->end()) return f->second;
-        }
-        return NONE;
+        auto f = env.find(n);
+        return f != env.end() ? f->second : NONE;
     }
 
     // ---- pass 1: scan headers ----
@@ -224,14 +225,119 @@ struct Parser {
     void parse_body(FuncHeader& h) {
         FuncInfo& fi = w.func_info(h.node);
         cur_result_ty = h.result_type;
-        scope_push();
+        env.clear();
+        mutables.clear();
         for (size_t i = 0; i < h.param_names.size(); i++) bind(h.param_names[i], fi.params[i]);
         p = h.body_begin;
-        expect(Tok::LBrace, "{");
-        NodeId v = parse_expr(0);
-        expect(Tok::RBrace, "}");
+        NodeId v = parse_stmt_block();  // statements + tail/return value
         w.end_func(h.node, v);
-        scope_pop();
+    }
+
+    bool peek_assign() {
+        return is(Tok::Ident) && p + 1 < toks.size() && toks[p + 1].kind == Tok::Assign;
+    }
+
+    // Parse a `{ stmt* tail? }` block; returns the tail (or `return`) value, NONE if void.
+    NodeId parse_stmt_block() {
+        expect(Tok::LBrace, "{");
+        NodeId tail = NONE;
+        while (!is(Tok::RBrace) && !is(Tok::End)) {
+            if (accept(Tok::KwReturn)) { tail = parse_expr(0); accept(Tok::Semi); break; }
+            if (is(Tok::KwVar) || is(Tok::KwLet)) {
+                bool is_var = cur().kind == Tok::KwVar; p++;
+                if (!is(Tok::Ident)) err("expected name after var/let");
+                std::string name = cur().text; p++;
+                expect(Tok::Assign, "=");
+                NodeId val = parse_expr(0);
+                expect(Tok::Semi, ";");
+                env[name] = val;
+                if (is_var) mutables.insert(name);
+                continue;
+            }
+            if (is(Tok::KwWhile)) { parse_while(); continue; }
+            // if / loop: block-like — a tail value if followed by `}`, else a statement (no `;`)
+            if (is(Tok::KwIf)) {
+                NodeId e = parse_if();
+                if (is(Tok::RBrace)) { tail = e; break; }
+                continue;
+            }
+            if (is(Tok::KwLoop)) {
+                NodeId e = parse_loop();
+                if (is(Tok::RBrace)) { tail = e; break; }
+                accept(Tok::Semi);
+                continue;
+            }
+            if (peek_assign()) {
+                std::string name = cur().text; p++;
+                expect(Tok::Assign, "=");
+                NodeId val = parse_expr(0);
+                expect(Tok::Semi, ";");
+                if (!env.count(name)) err("assignment to undeclared '" + name + "'");
+                if (!mutables.count(name)) err("assignment to immutable '" + name + "' (use var)");
+                env[name] = val;
+                continue;
+            }
+            // general expression: a tail value (if followed by `}`) or an expression statement
+            NodeId e = parse_expr(0);
+            if (is(Tok::RBrace)) { tail = e; break; }
+            expect(Tok::Semi, ";");
+        }
+        expect(Tok::RBrace, "}");
+        return tail;
+    }
+
+    // Locate the body `{` of a while: first `{` not nested in () or [].
+    size_t find_body_brace(size_t from) {
+        int paren = 0, brack = 0;
+        for (size_t q = from; toks[q].kind != Tok::End; q++) {
+            Tok k = toks[q].kind;
+            if (k == Tok::LParen) paren++;
+            else if (k == Tok::RParen) paren--;
+            else if (k == Tok::LBracket) brack++;
+            else if (k == Tok::RBracket) brack--;
+            else if (k == Tok::LBrace && paren == 0 && brack == 0) return q;
+        }
+        err("expected while body");
+    }
+
+    // Names that are assigned (`name = ...`) anywhere inside the block starting at `pos`.
+    std::vector<std::string> scan_modified(size_t pos) {
+        std::vector<std::string> out;
+        std::unordered_set<std::string> seen;
+        int depth = 0;
+        for (size_t q = pos; toks[q].kind != Tok::End; q++) {
+            if (toks[q].kind == Tok::LBrace) depth++;
+            else if (toks[q].kind == Tok::RBrace) { if (--depth == 0) break; }
+            else if (toks[q].kind == Tok::Ident && toks[q + 1].kind == Tok::Assign)
+                if (seen.insert(toks[q].text).second) out.push_back(toks[q].text);
+        }
+        return out;
+    }
+
+    // while c { body } : variables modified in the body become loop-carried (multi-result).
+    void parse_while() {
+        expect(Tok::KwWhile, "while");
+        Env pre = env;  // snapshot to restore after the loop (drops body-local vars)
+        size_t body_brace = find_body_brace(p);
+        std::vector<std::string> mod = scan_modified(body_brace);
+        std::vector<std::string> names;
+        for (auto& m : mod) if (env.count(m)) names.push_back(m);
+        std::vector<NodeId> inits, params;
+        for (auto& nm : names) inits.push_back(env[nm]);
+        for (size_t k = 0; k < names.size(); k++) {
+            NodeId pm = w.param(w.node(inits[k]).type, (int)k, names[k]);
+            params.push_back(pm);
+            env[names[k]] = pm;  // body sees the carried value
+        }
+        NodeId cond = to_bool(parse_expr(0));            // uses carried params; p -> body `{`
+        NodeId is_break = w.cmp(Op::CmpEq, cond, w.konst_bool(false));  // break when !cond
+        parse_stmt_block();                              // body; mutates env[names]
+        std::vector<NodeId> next_vals;
+        for (auto& nm : names) next_vals.push_back(env[nm]);
+        NodeId lp = w.make_loop_multi(inits, params, is_break, params, next_vals);
+        env = pre;  // restore; then publish post-loop values of the carried vars
+        for (size_t k = 0; k < names.size(); k++)
+            env[names[k]] = w.proj(lp, (int)k, w.node(inits[k]).type);
     }
 
     // precedence-climbing
@@ -319,10 +425,11 @@ struct Parser {
         expect(Tok::Assign, "=");
         NodeId val = parse_expr(0);
         expect(Tok::Semi, ";");
-        scope_push();
-        bind(name, val);
+        bool had = env.count(name) != 0;
+        NodeId old = had ? env[name] : NONE;
+        env[name] = val;
         NodeId body = parse_expr(0);
-        scope_pop();
+        if (had) env[name] = old; else env.erase(name);
         return body;
     }
 
@@ -333,18 +440,30 @@ struct Parser {
         return w.cmp(Op::CmpNe, c, w.konst(0, w.node(c).type));
     }
 
+    // if/else as both expression (yields a value) and statement (merges mutated vars).
     NodeId parse_if() {
         expect(Tok::KwIf, "if");
         NodeId c = to_bool(parse_expr(0));
-        expect(Tok::LBrace, "{");
-        NodeId then_v = parse_expr(0);
-        expect(Tok::RBrace, "}");
-        expect(Tok::KwElse, "else");
-        expect(Tok::LBrace, "{");
-        NodeId else_v = parse_expr(0);
-        expect(Tok::RBrace, "}");
-        // yields[0] = predicate-false = else, yields[1] = predicate-true = then
-        return w.make_cond(c, w.node(then_v).type, {else_v, then_v});
+        Env snap = env;
+        NodeId v1 = parse_stmt_block();          // then branch (mutates env)
+        Env envA = env;
+        env = snap;                              // reset for else
+        NodeId v2 = NONE;
+        if (accept(Tok::KwElse)) {
+            if (is(Tok::KwIf)) v2 = parse_if();   // else-if chain
+            else v2 = parse_stmt_block();
+        }
+        Env envB = env;
+        // merge every variable that existed before the if and changed in either branch
+        env = snap;
+        for (auto& kv : snap) {
+            NodeId a = envA.count(kv.first) ? envA[kv.first] : kv.second;
+            NodeId b = envB.count(kv.first) ? envB[kv.first] : kv.second;
+            env[kv.first] = (a == b) ? a : w.make_cond(c, w.node(a).type, {b, a});
+        }
+        // the if-expression's value: yields[0]=else, yields[1]=then
+        if (v1 != NONE && v2 != NONE) return w.make_cond(c, w.node(v1).type, {v2, v1});
+        return NONE;  // statement-if has no value
     }
 
     NodeId parse_ident() {
@@ -403,8 +522,9 @@ struct Parser {
         expect(Tok::RParen, ")");
         // carried params
         std::vector<NodeId> params;
-        scope_push();
+        std::vector<std::pair<std::string, NodeId>> saved;  // (name, old value or NONE)
         for (size_t i = 0; i < names.size(); i++) {
+            saved.push_back({names[i], env.count(names[i]) ? env[names[i]] : NONE});
             NodeId pn = w.param(w.node(inits[i]).type, (int)i, names[i]);
             params.push_back(pn);
             bind(names[i], pn);
@@ -412,7 +532,7 @@ struct Parser {
         expect(Tok::LBrace, "{");
         Step st = parse_step(params);
         expect(Tok::RBrace, "}");
-        scope_pop();
+        for (auto& s : saved) { if (s.second != NONE) env[s.first] = s.second; else env.erase(s.first); }
         NodeId lp = w.make_loop(inits, w.node(st.break_val).type, params,
                                 st.is_break, st.break_val, st.next_vals);
         return lp;
@@ -440,10 +560,11 @@ struct Parser {
             expect(Tok::Assign, "=");
             NodeId val = parse_expr(0);
             expect(Tok::Semi, ";");
-            scope_push();
-            bind(name, val);
+            bool had = env.count(name) != 0;
+            NodeId old = had ? env[name] : NONE;
+            env[name] = val;
             Step s = parse_step(carried);
-            scope_pop();
+            if (had) env[name] = old; else env.erase(name);
             return s;
         }
         if (accept(Tok::KwIf)) {
