@@ -13,7 +13,9 @@
 #include <windows.h>
 
 #include "helix/backend.hpp"
+#include "helix/schedule.hpp"
 #include "helix/vcode.hpp"
+#include "helix/verify.hpp"
 #include "helix/x64.hpp"
 
 namespace helix {
@@ -28,6 +30,17 @@ struct CompileError {
     std::string msg;
 };
 
+#ifndef NDEBUG
+// Debug/CI builds verify each function before lowering it, so the fuzzers exercise the
+// verifier on every generated graph (it runs only in the CLI otherwise).
+static void verify_in_debug(World& w, NodeId f) {
+    VerifyResult vr = verify_func(w, f);
+    if (!vr.ok)
+        throw CompileError{"verifier rejected '" + w.func_info(f).name + "'" +
+                           (vr.errors.empty() ? "" : ": " + vr.errors[0])};
+}
+#endif
+
 constexpr Reg kArgRegs[4] = {RCX, RDX, R8, R9};
 // Allocatable registers: callee-saved, so any value held in one survives a call.
 constexpr Reg kAllocRegs[] = {RBX, RSI, RDI, R12, R13, R14, R15};
@@ -38,9 +51,10 @@ struct Lowerer {
     World& w;
     VFunc vf;
     int cur = 0;
-    std::unordered_map<NodeId, VReg> cache;   // per-block value numbering
+    std::unordered_map<NodeId, VReg> cache;   // node -> vreg (lowered once, in a dominating block)
     std::unordered_map<NodeId, VReg> params;  // func + loop-carried params (persistent)
     std::unordered_map<NodeId, std::vector<VReg>> loop_results;  // multi-result loop -> result vregs
+    Schedule sched_;                          // GCM placement: node -> region
 
     Lowerer(World& world, NodeId f) : w(world) {
         const FuncInfo& fi = w.func_info(f);
@@ -52,12 +66,13 @@ struct Lowerer {
 
     VReg fresh() { return vf.nvregs++; }
     int new_block() { vf.blocks.emplace_back(); return (int)vf.blocks.size() - 1; }
-    void set_block(int b) { cur = b; cache.clear(); }
+    void set_block(int b) { cur = b; }  // cache is global: each node lowered once, in a
+                                         // dominating block (multi-use values are hoisted).
     void emit(const MInst& m) { vf.blocks[cur].insns.push_back(m); }
 
     void run() {
         const FuncInfo& fi = w.func_info(vf.node);
-        if (fi.params.size() > 4) throw CompileError{"more than 4 params unsupported"};
+        if (fi.params.size() > 8) throw CompileError{"more than 8 params unsupported"};
         cur = new_block();
         for (int i = 0; i < (int)fi.params.size(); i++) {
             VReg pv = fresh();
@@ -65,6 +80,10 @@ struct Lowerer {
             MInst m; m.op = MOp::MovArg; m.dst = pv; m.imm = i; m.type = fi.param_types[i];
             emit(m);
         }
+        // Global Code Motion: place every value in the region that dominates all its
+        // uses, then lower each region's nodes once at the correct program point.
+        sched_ = build_schedule(w, vf.node);
+        lower_region(sched_.post[sched_.root]);
         VReg r = lower(fi.result);
         if (fi.state_result != NONE) lower(fi.state_result);  // emit pending memory writes
         MInst ret; ret.op = MOp::Ret; ret.a = r; emit(ret);
@@ -86,17 +105,17 @@ struct Lowerer {
                 MInst m; m.op = MOp::MovImm; m.dst = r; m.imm = n.imm; m.type = n.type; emit(m);
                 break;
             }
-            case Op::Add: r = bin(MOp::Add, n); break;
-            case Op::Sub: r = bin(MOp::Sub, n); break;
-            case Op::Mul: r = bin(MOp::Mul, n); break;
-            case Op::SDiv: r = bin(MOp::Div, n); break;
-            case Op::SRem: r = bin(MOp::Rem, n); break;
-            case Op::And: r = bin(MOp::And, n); break;
-            case Op::Or: r = bin(MOp::Or, n); break;
-            case Op::Xor: r = bin(MOp::Xor, n); break;
-            case Op::Shl: r = bin(MOp::Shl, n); break;
-            case Op::AShr: r = bin(MOp::Sar, n); break;
-            case Op::LShr: r = bin(MOp::Shr, n); break;
+            case Op::Add: r = bin(MOp::Add, n, true, true); break;
+            case Op::Sub: r = bin(MOp::Sub, n, false, true); break;
+            case Op::Mul: r = bin(MOp::Mul, n, true, true); break;
+            case Op::SDiv: r = bin(MOp::Div, n, false, false); break;  // div guard keeps both regs
+            case Op::SRem: r = bin(MOp::Rem, n, false, false); break;
+            case Op::And: r = bin(MOp::And, n, true, true); break;
+            case Op::Or: r = bin(MOp::Or, n, true, true); break;
+            case Op::Xor: r = bin(MOp::Xor, n, true, true); break;
+            case Op::Shl: r = bin(MOp::Shl, n, false, true); break;
+            case Op::AShr: r = bin(MOp::Sar, n, false, true); break;
+            case Op::LShr: r = bin(MOp::Shr, n, false, true); break;
             case Op::Neg: r = un(MOp::Neg, n); break;
             case Op::Not: r = un(MOp::Not, n); break;
             case Op::CmpEq: r = cmpv(CC_E, n); break;
@@ -149,9 +168,37 @@ struct Lowerer {
         return r;
     }
 
-    VReg bin(MOp op, const Node& n) {
-        VReg la = lower(n.ins[0]), lb = lower(n.ins[1]);
+    static bool fits_i32(int64_t v) { return v >= INT32_MIN && v <= INT32_MAX; }
+    // When operands are swapped (cmp b, C  for  cmp C, b), the relation flips.
+    static CC swap_cc(CC c) {
+        switch (c) {
+            case CC_L: return CC_G;  case CC_G: return CC_L;
+            case CC_LE: return CC_GE; case CC_GE: return CC_LE;
+            default: return c;  // E / NE are symmetric
+        }
+    }
+
+    // dst = a OP b, folding a constant operand into an imm32 when it fits (commutative
+    // ops also accept a constant LHS). Div/Rem pass allow_imm=false (their guard path
+    // needs both operands in registers).
+    VReg bin(MOp op, const Node& n, bool commutative, bool allow_imm) {
         VReg r = fresh();
+        if (allow_imm) {
+            if (auto cb = w.as_const(n.ins[1]); cb && fits_i32(*cb)) {
+                VReg la = lower(n.ins[0]);
+                MInst m; m.op = op; m.dst = r; m.a = la; m.b_imm = true; m.imm = *cb; m.type = n.type;
+                emit(m);
+                return r;
+            }
+            if (commutative)
+                if (auto ca = w.as_const(n.ins[0]); ca && fits_i32(*ca)) {
+                    VReg lb = lower(n.ins[1]);
+                    MInst m; m.op = op; m.dst = r; m.a = lb; m.b_imm = true; m.imm = *ca; m.type = n.type;
+                    emit(m);
+                    return r;
+                }
+        }
+        VReg la = lower(n.ins[0]), lb = lower(n.ins[1]);
         MInst m; m.op = op; m.dst = r; m.a = la; m.b = lb; m.type = n.type; emit(m);
         return r;
     }
@@ -162,26 +209,46 @@ struct Lowerer {
         return r;
     }
     VReg cmpv(CC cc, const Node& n) {
-        VReg la = lower(n.ins[0]), lb = lower(n.ins[1]);
         VReg r = fresh();
+        if (auto cb = w.as_const(n.ins[1]); cb && fits_i32(*cb)) {  // cmp a, imm
+            VReg la = lower(n.ins[0]);
+            MInst m; m.op = MOp::SetCmp; m.dst = r; m.a = la; m.b_imm = true; m.imm = *cb;
+            m.cc = cc; m.type = ty_bool(); emit(m);
+            return r;
+        }
+        if (auto ca = w.as_const(n.ins[0]); ca && fits_i32(*ca)) {  // cmp b, imm (swapped)
+            VReg lb = lower(n.ins[1]);
+            MInst m; m.op = MOp::SetCmp; m.dst = r; m.a = lb; m.b_imm = true; m.imm = *ca;
+            m.cc = swap_cc(cc); m.type = ty_bool(); emit(m);
+            return r;
+        }
+        VReg la = lower(n.ins[0]), lb = lower(n.ins[1]);
         MInst m; m.op = MOp::SetCmp; m.dst = r; m.a = la; m.b = lb; m.cc = cc; m.type = ty_bool();
         emit(m);
         return r;
+    }
+
+    // Lower every node the scheduler assigned to one region, in topological order
+    // (operands first), into the current block.
+    void lower_region(const std::vector<NodeId>& nodes) {
+        for (NodeId nd : nodes) lower(nd);
     }
 
     VReg lower_cond(NodeId v) {
         const Node& n = w.node(v);
         const CondInfo& ci = w.cond_info(v);
         if (ci.yields.size() != 2) throw CompileError{"binary cond only"};
-        VReg pred = lower(n.ins[0]);
+        VReg pred = lower(n.ins[0]);  // predicate (already lowered in the enclosing region)
         int tb = new_block(), eb = new_block(), jb = new_block();
         MInst br; br.op = MOp::Br; br.a = pred; br.target = tb; br.target2 = eb; emit(br);
         VReg r = fresh();
         set_block(tb);
+        lower_region(sched_.post[sched_.cond_arm1.at(v)]);  // then arm
         VReg tv = lower(ci.yields[1]);
         emit_mov(r, tv, n.type);
         emit_jmp(jb);
         set_block(eb);
+        lower_region(sched_.post[sched_.cond_arm0.at(v)]);  // else arm
         VReg ev = lower(ci.yields[0]);
         emit_mov(r, ev, n.type);
         emit_jmp(jb);
@@ -190,13 +257,18 @@ struct Lowerer {
         return r;
     }
 
-    VReg lower_loop(NodeId v) {
+    // Build the carried-param registers and the four blocks of a loop, lower the body
+    // with the schedule split around the exit test (pre[] before, post[] after), and
+    // leave the encoder positioned at the exit block `xb` with carried regs `cv` live.
+    struct LoopFrame { std::vector<VReg> cv; int xb; int ab; };
+    LoopFrame lower_loop_skeleton(NodeId v) {
         const Node& n = w.node(v);
         const LoopInfo& li = w.loop_info(v);
         const int k = (int)li.params.size();
+        int body = sched_.loop_body.at(v);
         std::vector<VReg> cv(k);
         for (int i = 0; i < k; i++) {
-            VReg iv = lower(n.ins[i]);
+            VReg iv = lower(n.ins[i]);  // inits lowered in the enclosing region
             cv[i] = fresh();
             emit_mov(cv[i], iv, w.node(li.params[i]).type);
             params[li.params[i]] = cv[i];
@@ -205,9 +277,11 @@ struct Lowerer {
         emit_jmp(hb);
         set_block(hb);
         for (int i = 0; i < k; i++) params[li.params[i]] = cv[i];
+        lower_region(sched_.pre[body]);  // is_break / break-value cone (before the test)
         VReg bv = lower(li.is_break);
         { MInst br; br.op = MOp::Br; br.a = bv; br.target = xb; br.target2 = bb; emit(br); }
         set_block(bb);
+        lower_region(sched_.post[body]);  // body + next-value cone (after the test)
         std::vector<VReg> nv(k);
         for (int i = 0; i < k; i++) nv[i] = lower(li.next_vals[i]);
         std::vector<VReg> tmp(k);
@@ -215,11 +289,18 @@ struct Lowerer {
         for (int i = 0; i < k; i++) emit_mov(cv[i], tmp[i], w.node(li.params[i]).type);
         emit_jmp(hb);
         set_block(xb);
+        return {std::move(cv), xb, ab};
+    }
+
+    VReg lower_loop(NodeId v) {
+        const Node& n = w.node(v);
+        const LoopInfo& li = w.loop_info(v);
+        LoopFrame lf = lower_loop_skeleton(v);
         VReg r = fresh();
         VReg bvv = lower(li.break_val);
         emit_mov(r, bvv, n.type);
-        emit_jmp(ab);
-        set_block(ab);
+        emit_jmp(lf.ab);
+        set_block(lf.ab);
         cache[v] = r;
         return r;
     }
@@ -227,30 +308,8 @@ struct Lowerer {
     // Multi-result loop: emit once, leaving each break value in its own result vreg.
     void lower_loop_multi(NodeId v) {
         if (loop_results.count(v)) return;
-        const Node& n = w.node(v);
         const LoopInfo& li = w.loop_info(v);
-        const int k = (int)li.params.size();
-        std::vector<VReg> cv(k);
-        for (int i = 0; i < k; i++) {
-            VReg iv = lower(n.ins[i]);
-            cv[i] = fresh();
-            emit_mov(cv[i], iv, w.node(li.params[i]).type);
-            params[li.params[i]] = cv[i];
-        }
-        int hb = new_block(), bb = new_block(), xb = new_block(), ab = new_block();
-        emit_jmp(hb);
-        set_block(hb);
-        for (int i = 0; i < k; i++) params[li.params[i]] = cv[i];
-        VReg bv = lower(li.is_break);
-        { MInst br; br.op = MOp::Br; br.a = bv; br.target = xb; br.target2 = bb; emit(br); }
-        set_block(bb);
-        std::vector<VReg> nv(k);
-        for (int i = 0; i < k; i++) nv[i] = lower(li.next_vals[i]);
-        std::vector<VReg> tmp(k);
-        for (int i = 0; i < k; i++) { tmp[i] = fresh(); emit_mov(tmp[i], nv[i], w.node(li.params[i]).type); }
-        for (int i = 0; i < k; i++) emit_mov(cv[i], tmp[i], w.node(li.params[i]).type);
-        emit_jmp(hb);
-        set_block(xb);
+        LoopFrame lf = lower_loop_skeleton(v);
         std::vector<VReg> results;
         for (NodeId bvn : li.break_vals) {
             VReg rv = fresh();
@@ -258,14 +317,14 @@ struct Lowerer {
             emit_mov(rv, x, w.node(bvn).type);
             results.push_back(rv);
         }
-        emit_jmp(ab);
-        set_block(ab);
+        emit_jmp(lf.ab);
+        set_block(lf.ab);
         loop_results[v] = std::move(results);
     }
 
     VReg lower_call(NodeId v) {
         const Node& n = w.node(v);
-        if (n.ins.size() > 4) throw CompileError{"more than 4 call args unsupported"};
+        if (n.ins.size() > 8) throw CompileError{"more than 8 call args unsupported"};
         std::vector<VReg> args;
         for (NodeId a : n.ins) args.push_back(lower(a));
         VReg r = fresh();
@@ -410,6 +469,7 @@ struct FnEncoder {
     std::vector<std::pair<size_t, NodeId>> call_relocs;
     std::vector<int> saved_regs;       // alloc reg indices saved in prologue
     int num_saved = 0;
+    int max_stack_args_ = 0;           // most stack-passed (5th+) call args in this fn
     size_t sub_rsp_imm_pos = 0;
 
     FnEncoder(const VFunc& f, const Alloc& a_) : vf(f), al(a_) {}
@@ -426,11 +486,20 @@ struct FnEncoder {
         if (al.reg[v] >= 0) { if (areg(al.reg[v]) != scratch) a.mov_rr(areg(al.reg[v]), scratch); }
         else a.store(spill_disp(al.spill[v]), scratch);
     }
-    void narrow(Reg r, Type t) { if (t.kind == TyKind::Int && t.bits == 32) a.movsxd(r, r); }
+    void narrow(Reg r, Type t) {  // sign-extend i8/i16/i32 results to 64 (match interp trunc)
+        if (t.kind != TyKind::Int) return;
+        if (t.bits == 8) a.movsx8(r, r);
+        else if (t.bits == 16) a.movsx16(r, r);
+        else if (t.bits == 32) a.movsxd(r, r);
+    }
 
     void run() {
         for (int i = 0; i < (int)al.reg_used.size(); i++) if (al.reg_used[i]) saved_regs.push_back(i);
         num_saved = (int)saved_regs.size();
+        for (const auto& bl : vf.blocks)  // reserve outgoing stack-arg space for any call
+            for (const MInst& in : bl.insns)
+                if (in.op == MOp::Call && (int)in.args.size() - 4 > max_stack_args_)
+                    max_stack_args_ = (int)in.args.size() - 4;
         for (int i = 0; i < (int)vf.blocks.size(); i++) blk.push_back(a.new_label());
 
         a.push_rbp();
@@ -444,7 +513,8 @@ struct FnEncoder {
             for (const MInst& in : vf.blocks[b].insns) encode(in);
         }
 
-        int32_t frame = (int32_t)(((num_saved + al.num_spills) * 8 + 32 + 15) & ~15);
+        int32_t frame =
+            (int32_t)(((num_saved + al.num_spills) * 8 + 32 + max_stack_args_ * 8 + 15) & ~15);
         auto& by = a.bytes();
         for (int i = 0; i < 4; i++) by[sub_rsp_imm_pos + i] = (uint8_t)((uint32_t)frame >> (8 * i));
         a.finalize();
@@ -472,9 +542,11 @@ struct FnEncoder {
     void encode(const MInst& in) {
         switch (in.op) {
             case MOp::MovArg: {
-                Reg ar = kArgRegs[in.imm];
-                if (in.type.kind == TyKind::Int && in.type.bits == 32) a.movsxd(ar, ar);
-                put(in.dst, ar);
+                // args 0-3 in registers; args 4+ on the stack at [rbp + 16 + 8*i]
+                Reg src = (in.imm < 4) ? kArgRegs[in.imm] : RAX;
+                if (in.imm >= 4) a.load(RAX, 16 + 8 * (int)in.imm);
+                narrow(src, in.type);  // sign-extend a narrow-typed incoming arg
+                put(in.dst, src);
                 break;
             }
             case MOp::MovImm: {
@@ -498,8 +570,12 @@ struct FnEncoder {
                 Loc d = loc(in.dst);
                 Reg t = d.inreg ? d.r : RAX;
                 get(in.a, t);
-                Loc lb = loc(in.b);
-                if (lb.inreg) a.imul(t, lb.r); else a.imul_rm(t, lb.disp);
+                if (in.b_imm) {
+                    a.imul_rri(t, t, (int32_t)in.imm);  // t = a * imm32
+                } else {
+                    Loc lb = loc(in.b);
+                    if (lb.inreg) a.imul(t, lb.r); else a.imul_rm(t, lb.disp);
+                }
                 narrow(t, in.type);
                 if (!d.inreg) a.store(d.disp, t);
                 break;
@@ -511,7 +587,9 @@ struct FnEncoder {
             case MOp::Not: un2(in, false); break;
             case MOp::Div: case MOp::Rem: encode_div(in); break;
             case MOp::SetCmp:
-                get(in.a, RAX); alu_v(Alu::Cmp, RAX, in.b);
+                get(in.a, RAX);
+                if (in.b_imm) a.alu_ri(Alu::Cmp, RAX, (int32_t)in.imm);
+                else alu_v(Alu::Cmp, RAX, in.b);
                 a.setcc(in.cc); a.movzx_al(RAX); put(in.dst, RAX);
                 break;
             case MOp::Sel:
@@ -546,8 +624,9 @@ struct FnEncoder {
     void bin2(const MInst& in, Alu k) {
         Loc d = loc(in.dst);
         Reg t = d.inreg ? d.r : RAX;
-        get(in.a, t);            // mov t, a  (elided if a is already in t)
-        alu_v(k, t, in.b);       // t OP= b   (b is never in t: both are live here)
+        get(in.a, t);                              // mov t, a  (elided if a already in t)
+        if (in.b_imm) a.alu_ri(k, t, (int32_t)in.imm);  // t OP= imm32
+        else alu_v(k, t, in.b);                    // t OP= b   (b is never in t: both live)
         narrow(t, in.type);
         if (!d.inreg) a.store(d.disp, t);
     }
@@ -555,8 +634,8 @@ struct FnEncoder {
         Loc d = loc(in.dst);
         Reg t = d.inreg ? d.r : RAX;
         get(in.a, t);
-        get(in.b, RCX);          // count in CL (RCX is scratch, never an alloc reg)
-        a.shift(k, t);
+        if (in.b_imm) a.shift_ri(k, t, (uint8_t)in.imm);  // shift by constant
+        else { get(in.b, RCX); a.shift(k, t); }           // count in CL (RCX is scratch)
         narrow(t, in.type);
         if (!d.inreg) a.store(d.disp, t);
     }
@@ -587,7 +666,12 @@ struct FnEncoder {
         a.bind(Ldone);
     }
     void encode_call(const MInst& in) {
-        for (size_t i = 0; i < in.args.size(); i++) get(in.args[i], kArgRegs[i]);
+        // outgoing stack args (5th+) into the callee arg area at [rsp + 32 + 8*(i-4)]
+        for (size_t i = 4; i < in.args.size(); i++) {
+            get(in.args[i], RAX);
+            a.store_rsp(32 + 8 * (int)(i - 4), RAX);
+        }
+        for (size_t i = 0; i < in.args.size() && i < 4; i++) get(in.args[i], kArgRegs[i]);
         size_t pos0 = a.size();
         a.mov_ri(RAX, 0);
         call_relocs.push_back({pos0 + 2, (NodeId)in.imm});
@@ -611,6 +695,9 @@ JitModule jit_compile_ra(World& w) {
 
     try {
         for (NodeId f : w.module_funcs()) {
+#ifndef NDEBUG
+            verify_in_debug(w, f);
+#endif
             Lowerer lo(w, f);
             lo.run();
             Alloc al = allocate(lo.vf);
@@ -660,6 +747,9 @@ ObjModule compile_module_obj(World& w) {
     std::unordered_map<NodeId, size_t> idx;
     try {
         for (NodeId f : w.module_funcs()) {
+#ifndef NDEBUG
+            verify_in_debug(w, f);
+#endif
             Lowerer lo(w, f);
             lo.run();
             Alloc al = allocate(lo.vf);

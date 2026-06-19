@@ -22,4 +22,10 @@ void inline_into(World& w, NodeId func, int max_depth = 1);
 // function elimination). Order is deterministic (roots first, then discovery).
 std::vector<NodeId> reachable_functions(World& w, const std::vector<NodeId>& roots);
 
+// Run the middle-end on every function in the module: inline calls (re-folding via
+// the smart constructors). Only PURE functions are transformed — the Cloner is sound
+// only on the value strand, so functions that thread memory state are left untouched.
+// This is what `helixc -O` invokes; validated by the opt-vs-unopt differential fuzzer.
+void optimize_module(World& w, int inline_depth = 1);
+
 }  // namespace helix

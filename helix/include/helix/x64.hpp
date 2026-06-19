@@ -43,6 +43,8 @@ public:
     }
     void load(Reg dst, int32_t disp) { mem_rbp(0x8B, dst, disp); }   // mov dst,[rbp+disp]
     void store(int32_t disp, Reg src) { mem_rbp(0x89, src, disp); }  // mov [rbp+disp],src
+    void load_rsp(Reg dst, int32_t disp) { mem_rsp(0x8B, dst, disp); }   // mov dst,[rsp+disp]
+    void store_rsp(int32_t disp, Reg src) { mem_rsp(0x89, src, disp); }  // mov [rsp+disp],src
     void mov_rr(Reg dst, Reg src) { rr(0x89, src, dst); }            // 89: rm<-reg
 
     // ---- ALU reg,reg (dst OP= src); Cmp just sets flags ----
@@ -88,6 +90,37 @@ public:
         emit(0xD3);
         emit((uint8_t)(0xC0 | (ext << 3) | (dst & 7)));
     }
+    // dst OP= imm32 (sign-extended to 64): 81 /digit id. Add/Or/And/Sub/Xor/Cmp.
+    void alu_ri(Alu k, Reg dst, int32_t imm) {
+        uint8_t digit = 0;
+        switch (k) {
+            case Alu::Add: digit = 0; break;
+            case Alu::Or: digit = 1; break;
+            case Alu::And: digit = 4; break;
+            case Alu::Sub: digit = 5; break;
+            case Alu::Xor: digit = 6; break;
+            case Alu::Cmp: digit = 7; break;
+        }
+        rex(true, false, dst >= 8);
+        emit(0x81);
+        emit((uint8_t)(0xC0 | (digit << 3) | (dst & 7)));
+        emit_i32(imm);
+    }
+    // dst <<=/>>= imm8 : C1 /digit ib (count masked to 0..63 by the CPU).
+    void shift_ri(Shift k, Reg dst, uint8_t imm) {
+        uint8_t ext = k == Shift::Shl ? 4 : (k == Shift::Sar ? 7 : 5);
+        rex(true, false, dst >= 8);
+        emit(0xC1);
+        emit((uint8_t)(0xC0 | (ext << 3) | (dst & 7)));
+        emit((uint8_t)(imm & 63));
+    }
+    // dst = src * imm32 : 69 /r id (three-operand imul).
+    void imul_rri(Reg dst, Reg src, int32_t imm) {
+        rex(true, dst >= 8, src >= 8);
+        emit(0x69);
+        emit((uint8_t)(0xC0 | ((dst & 7) << 3) | (src & 7)));
+        emit_i32(imm);
+    }
     void neg(Reg r) { unary(0xF7, 3, r); }
     void not_(Reg r) { unary(0xF7, 2, r); }
     void idiv(Reg r) { unary(0xF7, 7, r); }
@@ -105,6 +138,16 @@ public:
     void movsxd(Reg dst, Reg src) {  // movsxd dst, src32 : sign-extend low 32 bits to 64
         rex(true, dst >= 8, src >= 8);
         emit(0x63);
+        emit((uint8_t)(0xC0 | ((dst & 7) << 3) | (src & 7)));
+    }
+    void movsx8(Reg dst, Reg src) {  // movsx dst, src8 : sign-extend low 8 bits to 64
+        rex(true, dst >= 8, src >= 8);
+        emit(0x0F); emit(0xBE);
+        emit((uint8_t)(0xC0 | ((dst & 7) << 3) | (src & 7)));
+    }
+    void movsx16(Reg dst, Reg src) {  // movsx dst, src16 : sign-extend low 16 bits to 64
+        rex(true, dst >= 8, src >= 8);
+        emit(0x0F); emit(0xBF);
         emit((uint8_t)(0xC0 | ((dst & 7) << 3) | (src & 7)));
     }
     void mov_from_mem(Reg dst, Reg base) {  // mov dst, [base]  (base must not be rbp/rsp/r12/r13)
@@ -172,6 +215,13 @@ private:
         rex(true, reg >= 8, false);
         emit(op);
         emit((uint8_t)(0x80 | ((reg & 7) << 3) | 5));
+        emit_i32(disp);
+    }
+    void mem_rsp(uint8_t op, Reg reg, int32_t disp) {  // [rsp + disp32], mod=10 rm=100 + SIB
+        rex(true, reg >= 8, false);
+        emit(op);
+        emit((uint8_t)(0x80 | ((reg & 7) << 3) | 4));  // rm=100 => SIB follows
+        emit(0x24);                                     // SIB: base=rsp, index=none, scale=1
         emit_i32(disp);
     }
     void add_fixup(Label l) { fixups_.push_back({code_.size(), l}); for (int i = 0; i < 4; i++) emit(0); }

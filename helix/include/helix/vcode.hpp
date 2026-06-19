@@ -37,7 +37,8 @@ struct MInst {
     VReg dst = VNONE;
     VReg a = VNONE, b = VNONE, c = VNONE;
     std::vector<VReg> args;          // Call arguments
-    int64_t imm = 0;                 // MovImm value / MovArg index / Call target func node
+    int64_t imm = 0;                 // MovImm value / MovArg index / Call target / imm operand
+    bool b_imm = false;              // operand `b` is the immediate in `imm` (no vreg use)
     CC cc = CC_E;                    // SetCmp condition
     Type type;                       // result width (for narrowing)
     int target = -1, target2 = -1;   // successor block indices (Jmp/Br)

@@ -54,6 +54,7 @@
 #include <string>
 #include <vector>
 
+#include "fuzz_watchdog.hpp"
 #include "helix/backend.hpp"
 #include "helix/eval.hpp"
 #include "helix/front.hpp"
@@ -281,6 +282,9 @@ int main(int argc, char** argv) {
     // are shallow, so this fuel is ample; out_of_fuel cases are simply skipped.
     const long kFuel = 5'000'000;
 
+    FuzzWatchdog wd;
+    wd.start();
+
     Stats st;
     bool found = false;
     std::string repro_src, repro_detail;
@@ -353,8 +357,16 @@ int main(int argc, char** argv) {
             EvalResult er = eval_func(w, f, args, kFuel);
             if (er.out_of_fuel || !er.ok) { st.cases_skipped++; continue; }
 
+            {  // watchdog: interp already terminated, so a hung JIT call is a real bug
+                std::string ctx = "function f args=[";
+                for (size_t i = 0; i < args.size(); i++)
+                    ctx += (i ? ", " : "") + std::to_string((long long)args[i]);
+                ctx += "]";
+                wd.arm(src, std::move(ctx), 3000);
+            }
             int64_t sv = simple.call(f, args);
             int64_t rv = ra.call(f, args);
+            wd.disarm();
             st.cases_run++;
 
             if (sv != er.value || rv != er.value) {

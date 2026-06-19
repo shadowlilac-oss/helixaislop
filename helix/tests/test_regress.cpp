@@ -101,6 +101,66 @@ TEST("regress: argument-count mismatch is a parse error") {
     World w2; CHECK(!parse_module(w2, "fn f(a: int, b: int) -> int { a }\nfn g() -> int { f(1) }\n").ok);
 }
 
+TEST("regress: GCM schedules break-value cond cone before the loop exit test") {
+    // fuzz_cf seed-1 repro. A single-result `loop` whose break value is an if-expr
+    // reading the loop counter at break (counter == 0). The break-value Cond is
+    // evaluated BEFORE the exit test; its arm references a body-region constant that
+    // the scheduler must also place pre-test (else it is read before being defined on
+    // the breaking iteration). Both backends AND the interpreter must agree.
+    World w;
+    auto st = parse_module(w,
+        "fn g(p2: i64) -> i64 {\n"
+        "  loop (t0 = 3) {\n"
+        "    if (t0 <= 0) { break if ((t0 | p2) < t0) { 1 } else { 0 } }\n"
+        "    else { next (t0 - 1) }\n"
+        "  }\n"
+        "}\n");
+    CHECK(st.ok);
+    JitModule simple = jit_compile(w), ra = jit_compile_ra(w);
+    CHECK(simple.ok);
+    CHECK(ra.ok);
+    NodeId g = w.find_func("g");
+    for (int64_t p2 : std::vector<int64_t>{-7, -1, 0, 1, 5, INT64_MIN, INT64_MAX}) {
+        int64_t expect = ((0 | p2) < 0) ? 1 : 0;  // at break t0==0
+        auto ir = eval_func(w, g, {p2});
+        CHECK(ir.ok);
+        CHECK_EQ(ir.value, expect);
+        CHECK_EQ(simple.call(g, {p2}), expect);
+        CHECK_EQ(ra.call(g, {p2}), expect);
+    }
+}
+
+TEST("regress: inner-loop result used in both arms of a following if (GCM domination)") {
+    // A value (inner loop's result) consumed from several control-divergent positions
+    // must be materialized once at a point dominating every use. Both backends + interp.
+    World w;
+    auto st = parse_module(w,
+        "fn f(n: int) -> int {\n"
+        "  var acc = 0; var i = 0;\n"
+        "  while i < n {\n"
+        "    var j = 0; var s = 0;\n"
+        "    while j < i { s = s + 1; j = j + 1; }\n"
+        "    if s > 2 { acc = acc + s; } else { acc = acc + 1; }\n"
+        "    i = i + 1;\n"
+        "  }\n"
+        "  return acc;\n"
+        "}\n");
+    CHECK(st.ok);
+    JitModule simple = jit_compile(w), ra = jit_compile_ra(w);
+    CHECK(simple.ok);
+    CHECK(ra.ok);
+    NodeId f = w.find_func("f");
+    for (int64_t n = 0; n <= 20; n++) {
+        int64_t acc = 0;
+        for (int64_t i = 0; i < n; i++) { int64_t s = i; acc += (s > 2 ? s : 1); }
+        auto ir = eval_func(w, f, {n});
+        CHECK(ir.ok);
+        CHECK_EQ(ir.value, acc);
+        CHECK_EQ(simple.call(f, {n}), acc);
+        CHECK_EQ(ra.call(f, {n}), acc);
+    }
+}
+
 TEST("regress: verifier does not flag a state-consuming Call as a dropped producer") {
     World w;
     NodeId g = w.begin_func("g", {ty_ptr()}, ty_i64(), /*has_state=*/true);

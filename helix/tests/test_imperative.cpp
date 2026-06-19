@@ -115,3 +115,42 @@ TEST("imperative: body-local var does not hijack an outer var (regression BUG5)"
     load(c, "fn f(n: int) -> int { var x = 100; var i = 0; while i < n { var x = i; x = x + 1; i = i + 1; } return x; }\n");
     for (int n = 0; n <= 10; n++) CHECK_EQ(diff(c, "f", {n}), 100);  // outer x stays 100
 }
+
+TEST("imperative: nested while with accumulator used in both if branches (regression)") {
+    // Inner-loop result feeds BOTH branches of a following if -> must be hoisted to
+    // dominate the branch (else the backends read a cross-branch garbage register).
+    C c;
+    load(c,
+        "fn f(n: int) -> int {\n"
+        "  var acc = n; var i = 1;\n"
+        "  while i < n {\n"
+        "    var j = 1;\n"
+        "    while j < n - 1 { acc = acc + 1; j = j + 1; }\n"
+        "    if i <= 0 - 14 { acc = acc + 7; }\n"   // never taken; acc used in both branches
+        "    i = i + 1;\n"
+        "  }\n"
+        "  return acc;\n"
+        "}\n");
+    for (int n = 0; n <= 25; n++) {
+        int64_t expect = (int64_t)n + (n >= 2 ? (int64_t)(n - 1) * (n - 2) : 0);
+        CHECK_EQ(diff(c, "f", {n}), expect);
+    }
+    // a genuinely-taken branch variant too
+    C c2;
+    load(c2,
+        "fn g(n: int) -> int {\n"
+        "  var acc = 0; var i = 0;\n"
+        "  while i < n {\n"
+        "    var j = 0; var s = 0;\n"
+        "    while j < i { s = s + 1; j = j + 1; }\n"
+        "    if s > 2 { acc = acc + s; } else { acc = acc + 1; }\n"
+        "    i = i + 1;\n"
+        "  }\n"
+        "  return acc;\n"
+        "}\n");
+    for (int n = 0; n <= 15; n++) {
+        int64_t acc = 0;
+        for (int i = 0; i < n; i++) { int s = i; acc += (s > 2 ? s : 1); }
+        CHECK_EQ(diff(c2, "g", {n}), acc);
+    }
+}

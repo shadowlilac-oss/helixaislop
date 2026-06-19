@@ -1,6 +1,7 @@
 #include "helix/eval.hpp"
 
 #include <unordered_map>
+#include <unordered_set>
 
 namespace helix {
 
@@ -10,8 +11,14 @@ struct Interp {
     World& w;
     long fuel;
     bool out_of_fuel = false;
+    long depth_ = 0;                          // current recursion depth of eval()
+    static constexpr long kMaxDepth = 8000;   // graceful cap (< the C++ stack) -> out_of_fuel
 
     explicit Interp(World& world, long f) : w(world), fuel(f) {}
+
+    // RAII recursion-depth tracker: a deeply nested graph trips out_of_fuel (which the
+    // tests/fuzzers treat as "skip") instead of overflowing the native stack.
+    struct DepthGuard { long& d; explicit DepthGuard(long& x) : d(x) { ++x; } ~DepthGuard() { --d; } };
 
     struct Frame {
         std::unordered_map<NodeId, int64_t> bind;  // Param -> value (incl. loop carried)
@@ -26,6 +33,8 @@ struct Interp {
 
     int64_t eval(NodeId id, Frame& fr) {
         if (out_of_fuel) return 0;
+        DepthGuard dg(depth_);
+        if (depth_ > kMaxDepth) { out_of_fuel = true; return 0; }
         const Node& n = w.node(id);
         switch (n.op) {
             case Op::ConstInt:
@@ -125,6 +134,16 @@ struct Interp {
         return result;
     }
 
+    // Invalidate only loop results NESTED in this loop's body (added after iteration
+    // began). Loops cached BEFORE iteration — preceding siblings reached via the linear
+    // $mem chain, or outer-scope loops — are invariant w.r.t. this loop's carried params,
+    // so they must persist: re-running one would re-execute its loads against memory that
+    // a later store has since mutated (a real bug exposed only by array writes).
+    void invalidate_nested(Frame& fr, const std::unordered_set<NodeId>& keep) {
+        for (auto it = fr.loop_multi.begin(); it != fr.loop_multi.end();)
+            it = keep.count(it->first) ? std::next(it) : fr.loop_multi.erase(it);
+    }
+
     int64_t eval_loop(NodeId id, Frame& fr) {
         const Node& n = w.node(id);
         const LoopInfo& li = w.loop_info(id);
@@ -132,12 +151,14 @@ struct Interp {
         cur.reserve(n.ins.size());
         for (NodeId init : n.ins) cur.push_back(eval(init, fr));
         if (out_of_fuel) return 0;
+        std::unordered_set<NodeId> keep;  // loops already cached are invariant here
+        for (auto& kv : fr.loop_multi) keep.insert(kv.first);
 
         for (;;) {
             if (!spend()) return 0;
             for (size_t k = 0; k < li.params.size(); k++) fr.bind[li.params[k]] = cur[k];
             fr.memo.clear();  // carried values changed -> invalidate pure cache
-            fr.loop_multi.clear();
+            invalidate_nested(fr, keep);
 
             int64_t brk = eval(li.is_break, fr);
             if (out_of_fuel) return 0;
@@ -158,11 +179,13 @@ struct Interp {
         cur.reserve(n.ins.size());
         for (NodeId init : n.ins) cur.push_back(eval(init, fr));
         if (out_of_fuel) return {};
+        std::unordered_set<NodeId> keep;  // loops already cached are invariant here
+        for (auto& kv : fr.loop_multi) keep.insert(kv.first);
         for (;;) {
             if (!spend()) return {};
             for (size_t k = 0; k < li.params.size(); k++) fr.bind[li.params[k]] = cur[k];
             fr.memo.clear();
-            fr.loop_multi.clear();
+            invalidate_nested(fr, keep);
             int64_t brk = eval(li.is_break, fr);
             if (out_of_fuel) return {};
             if (brk) {

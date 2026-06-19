@@ -6,16 +6,23 @@
 namespace helix {
 namespace {
 
+// Thrown when a clone recurses deeper than the C++ stack can safely take: the caller
+// catches it and leaves that function unoptimized (correct, just not inlined).
+struct CloneTooDeep {};
+
 // Clones a value subgraph through the smart constructors (so the clone is folded
 // / CSE'd), substituting per a node->node map, and inlining Call nodes up to a
 // bounded depth.
 struct Cloner {
     World& w;
+    int rec_ = 0;                            // current clone recursion depth
+    static constexpr int kMaxRec = 3000;     // < the C++ stack; trips CloneTooDeep
     Cloner(World& world) : w(world) {}
 
     NodeId clone(NodeId v, std::unordered_map<NodeId, NodeId>& map, int depth) {
         auto it = map.find(v);
         if (it != map.end()) return it->second;
+        if (++rec_ > kMaxRec) throw CloneTooDeep{};
         // COPY by value: building new nodes below reallocates the World's arenas,
         // which would dangle any reference into them.
         const Node n = w.node(v);
@@ -96,6 +103,7 @@ struct Cloner {
                 break;
         }
         map[v] = r;
+        --rec_;
         return r;
     }
 };
@@ -112,7 +120,8 @@ NodeId inline_call(World& w, NodeId call_node, int depth) {
     std::unordered_map<NodeId, NodeId> sub;
     for (size_t i = 0; i < tfi.params.size() && i < n.ins.size(); i++)
         sub[tfi.params[i]] = n.ins[i];
-    return c.clone(tfi.result, sub, depth - 1);
+    try { return c.clone(tfi.result, sub, depth - 1); }
+    catch (const CloneTooDeep&) { return call_node; }  // too deep: leave the call
 }
 
 void inline_into(World& w, NodeId func, int max_depth) {
@@ -121,8 +130,22 @@ void inline_into(World& w, NodeId func, int max_depth) {
     Cloner c(w);
     std::unordered_map<NodeId, NodeId> map;
     for (NodeId p : fi.params) map[p] = p;  // keep the function's own params
-    NodeId nr = c.clone(fi.result, map, max_depth);
+    NodeId nr;
+    try { nr = c.clone(fi.result, map, max_depth); }
+    catch (const CloneTooDeep&) { return; }  // too deep: leave the function unoptimized
     w.func_info(func).result = nr;
+}
+
+void optimize_module(World& w, int inline_depth) {
+    // Copy the function list: inline_into grows the World's arenas (but not this list).
+    std::vector<NodeId> funcs(w.module_funcs().begin(), w.module_funcs().end());
+    for (NodeId f : funcs) {
+        const FuncInfo& fi = w.func_info(f);
+        // Pure functions only: the Cloner does not clone Load/Store nodes (value strand
+        // only) and inline_into does not update state_result, so skip stateful functions.
+        if (fi.result != NONE && fi.state_result == NONE && !fi.has_state)
+            inline_into(w, f, inline_depth);
+    }
 }
 
 std::vector<NodeId> reachable_functions(World& w, const std::vector<NodeId>& roots) {

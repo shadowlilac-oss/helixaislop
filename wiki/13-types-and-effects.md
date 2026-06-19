@@ -2,6 +2,8 @@
 
 *Helix's shallow value-typed type system and its linear, fine-grained state-strand effect algebra: how types are ordinary `Const`/`Op` nodes, how effects are typed `state` tokens threaded linearly and enforced, and how provably-independent effects are reordered via fork/join.*
 
+> **⚠️ Design vs. built** (see [24-implementation-status](24-implementation-status.md), [25-path-to-production](25-path-to-production.md)). **Built today:** width/kind type tags (i8/i16/i32/i64/bool/ptr) on nodes; a *single* linear `$mem` state token threaded through loads/stores and enforced by the verifier; total signed division (`x/0→0`, `INT64_MIN/-1→INT64_MIN`, consistent across interpreter and both backends). **Not built:** an actual type *checker* (ill-typed programs are not rejected), unsigned/float/aggregate types, and — most importantly — the **fine-grained effect algebra**: there is exactly one global state token, with **no `fork`/`join`/`borrow` and no alias analysis**, so independent effects are *not* reordered. The "multiple independent states from day one" differentiator is design, not code.
+
 This page specifies the **type layer** and the **effect/state layer** of Helix. Both ride on
 the same two strands (see [Core Model](11-core-model.md)): the **value strand** (pure,
 duplicable, floats) carries types and data; the **state strand** (linear, pinned, ordered)

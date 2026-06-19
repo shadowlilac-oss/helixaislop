@@ -9,11 +9,11 @@ inlining + DCE), register-allocates, and emits real x86-64** — either JIT-exec
 or written to a **COFF object file** that `link.exe` turns into a native `.exe`.
 No secondary IR at either end.
 
-> Array **writes** were prototyped (a bubble sort ran natively) but a differential
-> fuzzer found ordering miscompiles in the threaded-state effect lowering, so writes
-> are **disabled** pending a correct region-port effect implementation (see the
-> [effects design](../wiki/13-types-and-effects.md)). Correctness over features — the
-> shipped compiler has no known miscompiles.
+> Array **writes** (`a[i] = v`, including in-place sorts) are supported: a linear
+> memory-state token is threaded through loads/stores and the Global Code Motion
+> scheduler places each store once, in order, never speculated past a guard. Validated
+> by ~1M differential cases (interp == simple == ra, return value AND final array).
+> The compiler has no known miscompiles.
 
 > **Honest scope.** This is a rigorously-tested compiler over a small (but
 > Turing-complete) integer language, not a finished production toolchain (matching
@@ -28,14 +28,23 @@ Every backend is validated by **differential testing**: for thousands of program
 and inputs, `jit(f)(args)` must equal `interp(f)(args)`. This makes even the
 aggressive register allocator safe — any miscompile shows up as a mismatch.
 
-- **66 unit/integration tests, ~21,300 assertions** (`./build.ps1`)
-- **~5,400** randomized differential checks for the optimizing backend
-- **405,651** randomized control-flow differential checks (separate fuzzer), 0 mismatches
-- **336,000** randomized memory/array-read differential checks (3-way), 0 mismatches
-- imperative + array-read programs validated **interp == simple == ra** on real arrays
+- **81 unit/integration tests, ~23,500 assertions** (`./build.ps1`); the verifier also runs
+  in-codegen on every test (debug builds), and `helixc -O` (inlining + dead-function DCE) is
+  wired into the driver and re-verifies
+- **millions of randomized differential cases, 0 mismatches**, across five generators:
+  `tools/fuzz_cf` (control flow / recursion / up-to-8-arg calls), `tools/fuzz_imp` (imperative
+  `while`/`if` + array reads **and writes**), `tools/fuzz_mem` (array reads) — each comparing
+  **interp == simple == ra** on the return value AND the final array; `tools/fuzz_opt`
+  (`interp(unopt) == interp(opt) == jit(opt) == jit(unopt)` — validates the optimizer); and
+  `tools/fuzz_parse` (60k malformed/garbage/deeply-nested inputs, **no crash**)
+- **CI**: `ci.ps1` + `.github/workflows/ci.yml` build, run the suite, and smoke-fuzz all engines
+- every fuzzer is wrapped by a **watchdog** (`tools/fuzz_watchdog.hpp`): the interpreter
+  proves each compared case terminates, so a JIT call that loops forever is a real
+  miscompile — the watchdog prints the repro and exits fast rather than hanging
 - **native link + run** of an emitted `.obj` is part of the suite (end-to-end)
-- a differential fuzzer is how the array-write miscompiles were caught — *that* is the
-  bar this project holds itself to
+- differential fuzzing is how the array-write, the **scheduling (GCM)**, and a cross-loop
+  interpreter-memoization miscompile were all caught — *that* is the bar this project
+  holds itself to
 
 ## What works (and is tested)
 
@@ -49,18 +58,21 @@ aggressive register allocator safe — any miscompile shows up as a mismatch.
 | **Verifier**: acyclicity, single-origin SSA, regions, **enforced linear state** | ✅ | `src/verify.cpp` |
 | Textual **printer** | ✅ | `src/print.cpp` |
 | Simple backend: memory-backed codegen (oracle baseline) | ✅ | `src/backend.cpp` |
-| **Optimizing backend**: VCode → liveness → **linear-scan register allocation** (callee-saved homes, stack spills) → x86-64 | ✅ | `src/backend2.cpp`, `include/helix/vcode.hpp` |
+| **Optimizing backend**: VCode → liveness → **linear-scan register allocation** (callee-saved homes, stack spills) + **immediate operands** (`x+c`, `x<<3`, `x<c` fold the constant into the instruction) → x86-64 | ✅ | `src/backend2.cpp`, `include/helix/vcode.hpp` |
 | **Middle-end opt passes**: function inlining, dead-function reachability | ✅ | `src/opt.cpp` |
+| **Global Code Motion**: place each value once in the region (LCA of uses) that dominates them; loop bodies split around the exit test. Shared by both backends | ✅ | `src/schedule.cpp` |
 | **Imperative frontend**: mutable `var`, assignment, `while`, statement-`if` (on-the-fly SSA) | ✅ | `src/front.cpp` |
 | **Multi-result loop regions** + `Proj` (so `while` can output several vars) | ✅ | `src/ir.cpp`, both backends |
-| **Read-only array memory** (`a[i]` pure loads, CSE'd) lowered to native loads | ✅ | `src/front.cpp`, both backends |
+| **Array memory**: `a[i]` reads (CSE'd pure loads) and `a[i] = v` **writes** (linear $mem state, GCM-ordered) → native loads/stores; in-place sorts work | ✅ | `src/front.cpp`, both backends |
+| **Win64 ABI ≤ 8 args**: 4 in registers, 5th+ on the stack (in and out) | ✅ | both backends, `src/x64.hpp` |
+| **Integer widths** i8 / i16 / i32 / i64 (narrow arithmetic wraps; args sign-extend) | ✅ | `src/front.cpp`, both backends |
 | **COFF object emission** → link with `link.exe` → native `.exe` | ✅ | `src/coff.cpp`, `src/backend2.cpp` |
 | Independent x86-64 **disassembler** (second check on the encoder) | ✅ | `src/disasm.cpp` |
 
 ## Build & run (Windows / MSVC)
 
 ```powershell
-./build.ps1 -Cli            # builds the test runner + helixc, runs the 55-test suite
+./build.ps1 -Cli            # builds the test runner + helixc, runs the full test suite
 
 # interpret / JIT a program (cross-checked against the interpreter)
 ./build/helixc.exe examples/demo.hx --run fib 30
@@ -109,34 +121,32 @@ fn amax(a: ptr, n: int) -> int {        // imperative: mutable vars, while, stat
 
 ## Out of scope / known limitations (honest)
 
-- **Array writes are disabled.** The prototype threaded a memory state through the graph,
-  but a differential fuzzer found the effect *lowering* misorders/duplicates stores in
-  certain read-after-conditional-store patterns. A correct fix needs state threaded through
-  region **ports** (the RVSDG approach in [`wiki/13`](../wiki/13-types-and-effects.md)), not
-  as free variables in branches — that is the next real piece of work. Reads work.
 - **Interpreter recursion depth.** The reference interpreter is recursive; pathologically
   deep recursion/nesting can overflow the C++ stack before the fuel limit trips (a fuzzer
   edge case, not hit by normal programs). The JITs are unaffected.
-- The surface language is small (i64-centric, `≤ 4` params); no structs, function
-  pointers, or strings.
+- The surface language is small (i64-centric with i8/i16/i32; `≤ 8` params); no structs,
+  function pointers, strings, or **unsigned** types (division/shift/compare are signed).
 - **`idiv` edge cases** (`x/0`, `INT64_MIN/-1`) are defined to match the interpreter
   (`0` / `INT64_MIN`) via guards rather than trapping.
-- Single target (**x86-64, Win64 ABI**), `≤ 4` parameters/args per function.
+- Single target (**x86-64, Win64 ABI**); the only loads/stores are i64 array cells
+  (`a[i]` is `*(i64*)(a + 8*i)`), so i8/i16/i32 apply to scalar arithmetic, not memory.
 - The register allocator is **linear-scan without live-range splitting or coalescing**.
-  With direct two-address codegen it runs **~1.37× faster** than the simple backend on
-  register-pressure code and **~1.07×** on loops, but is modestly *slower* on deep
-  recursion (callee-saved save/restore overhead the all-memory backend avoids) — a known
-  register-allocation tradeoff. Coalescing / shrink-wrapping would close that gap.
+  With direct two-address codegen and immediate operands it runs faster than the simple
+  backend on register-pressure code and loops, but is modestly *slower* on deep recursion
+  (callee-saved save/restore overhead the all-memory backend avoids) — a known tradeoff
+  coalescing / shrink-wrapping would close.
 
 ## Source layout
 
 ```
-include/helix/   ir, eval, front, verify, print, x64, vcode, backend, opt, coff, disasm
+include/helix/   ir, eval, front, verify, print, x64, vcode, backend, opt, coff, disasm,
+                 schedule
 src/             ir, eval, front, verify, print, backend (simple), backend2 (optimizing),
-                 opt, coff, disasm
+                 opt, coff, disasm, schedule (Global Code Motion, shared by both backends)
 tests/           test framework + test_{ir,eval,front,backend,backend_ra,verify,opt,
-                 memory,imperative,multiresult,components,regress,fuzz}.cpp
-tools/helixc.cpp the CLI driver (--run / --print / --emit-obj / --simple)
+                 memory,imperative,multiresult,components,regress,fuzz,writes,abi,types}.cpp
+tools/           helixc.cpp (CLI: --run / --print / --emit-obj / --simple);
+                 fuzz_{cf,imp,mem}.cpp differential fuzzers + fuzz_watchdog.hpp; bench.cpp
 examples/        demo.hx, exports.hx, driver.c
 build.ps1        MSVC build + test runner
 ```

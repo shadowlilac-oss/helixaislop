@@ -59,20 +59,17 @@ std::string dec_i64(int64_t v) {
     return std::string(buf);
 }
 
-// Render "[rbp-8]" / "[rbp+16]" / "[rbp+0]".
-std::string mem_rbp(int32_t disp) {
-    std::string s = "[rbp";
-    if (disp < 0) {
-        s += "-";
-        // careful with INT32_MIN
-        s += dec_i64(-(int64_t)disp);
-    } else {
-        s += "+";
-        s += dec_i64((int64_t)disp);
-    }
+// Render "[base-8]" / "[base+16]" / "[base+0]".
+std::string mem_disp(const char* base, int32_t disp) {
+    std::string s = "[";
+    s += base;
+    if (disp < 0) s += "-" + dec_i64(-(int64_t)disp);  // careful with INT32_MIN
+    else s += "+" + dec_i64((int64_t)disp);
     s += "]";
     return s;
 }
+std::string mem_rbp(int32_t disp) { return mem_disp("rbp", disp); }
+std::string mem_rsp(int32_t disp) { return mem_disp("rsp", disp); }
 
 int32_t read_i32(const uint8_t* p) {
     return (int32_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8) |
@@ -218,6 +215,19 @@ std::vector<DisInsn> disassemble_x64(const uint8_t* code, size_t len) {
                 continue;
             }
 
+            // movsx reg, r/m8 (0F BE) / r/m16 (0F BF)  (REX.W in Helix, mod=11)
+            if (op2 == 0xBE || op2 == 0xBF) {
+                if (p + 2 >= len) { fail(); continue; }
+                size_t mp = p + 2;
+                if (modrm_mod(mp) != 3) { fail(); continue; }
+                int dst = modrm_reg(mp), src = modrm_rm(mp);
+                ins.length = (p - pos) + 3;
+                ins.text = std::string("movsx ") + reg64_name(dst) + ", " + reg64_name(src);
+                out.push_back(ins);
+                pos += ins.length;
+                continue;
+            }
+
             // imul reg, r/m : 0F AF /r  (REX.W in Helix, mod=11)
             if (op2 == 0xAF) {
                 if (p + 2 >= len) { fail(); continue; }
@@ -256,6 +266,19 @@ std::vector<DisInsn> disassemble_x64(const uint8_t* code, size_t len) {
         if (rex && rex_w && !rex_r && !rex_b && op == 0x99) {
             ins.length = (p - pos) + 1;
             ins.text = "cqo";
+            out.push_back(ins);
+            pos += ins.length;
+            continue;
+        }
+
+        // ---- movsxd r64, r/m32 : REX.W 63 /r (mod=11) ----
+        if (rex && rex_w && op == 0x63) {
+            if (p + 1 >= len) { fail(); continue; }
+            size_t mp = p + 1;
+            if (modrm_mod(mp) != 3) { fail(); continue; }
+            int dst = modrm_reg(mp), src = modrm_rm(mp);
+            ins.length = (p - pos) + 2;
+            ins.text = std::string("movsxd ") + reg64_name(dst) + ", " + reg64_name(src);
             out.push_back(ins);
             pos += ins.length;
             continue;
@@ -336,6 +359,18 @@ std::vector<DisInsn> disassemble_x64(const uint8_t* code, size_t len) {
                     out.push_back(ins);
                     pos += ins.length;
                     continue;
+                } else if (mod == 2 && rmlow == 4) {
+                    // [rsp + disp32]: SIB (base=rsp=100, index=none=100, scale=0) = 0x24
+                    if (mp + 1 >= len || code[mp + 1] != 0x24) { fail(); continue; }
+                    if (mp + 2 + 4 > len) { fail(); continue; }
+                    int32_t disp = read_i32(&code[mp + 2]);
+                    ins.length = (p - pos) + 2 + 1 + 4;
+                    std::string m = mem_rsp(disp);
+                    std::string rn = reg64_name(reg);
+                    ins.text = std::string(mnem) + " " + (reg_is_dst ? rn + ", " + m : m + ", " + rn);
+                    out.push_back(ins);
+                    pos += ins.length;
+                    continue;
                 } else {
                     fail();
                     continue;
@@ -353,14 +388,51 @@ std::vector<DisInsn> disassemble_x64(const uint8_t* code, size_t len) {
             if (mp + 1 + 4 > len) { fail(); continue; }
             int32_t imm = read_i32(&code[mp + 1]);
             const char* mnem = nullptr;
-            switch (ext) {
+            switch (ext) {  // 81 /digit id : add/or/and/sub/xor/cmp r/m64, imm32
                 case 0: mnem = "add"; break;
+                case 1: mnem = "or"; break;
+                case 4: mnem = "and"; break;
                 case 5: mnem = "sub"; break;
+                case 6: mnem = "xor"; break;
+                case 7: mnem = "cmp"; break;
                 default: break;
             }
             if (!mnem) { fail(); continue; }
             ins.length = (p - pos) + 2 + 4;
             ins.text = std::string(mnem) + " " + reg64_name(rm) + ", " + dec_i64(imm);
+            out.push_back(ins);
+            pos += ins.length;
+            continue;
+        }
+
+        // ---- C1 /4 shl, /5 shr, /7 sar : shift r/m64, imm8 ----
+        if (op == 0xC1) {
+            if (p + 1 >= len) { fail(); continue; }
+            size_t mp = p + 1;
+            if (modrm_mod(mp) != 3) { fail(); continue; }
+            int ext = modrm_ext(mp), rm = modrm_rm(mp);
+            if (mp + 1 >= len) { fail(); continue; }
+            int imm = code[mp + 1];
+            const char* mnem = nullptr;
+            switch (ext) { case 4: mnem = "shl"; break; case 5: mnem = "shr"; break; case 7: mnem = "sar"; break; default: break; }
+            if (!mnem) { fail(); continue; }
+            ins.length = (p - pos) + 3;
+            ins.text = std::string(mnem) + " " + reg64_name(rm) + ", " + dec_i64(imm);
+            out.push_back(ins);
+            pos += ins.length;
+            continue;
+        }
+
+        // ---- 69 /r id : imul reg, r/m64, imm32 (three-operand) ----
+        if (op == 0x69) {
+            if (p + 1 >= len) { fail(); continue; }
+            size_t mp = p + 1;
+            if (modrm_mod(mp) != 3) { fail(); continue; }
+            int dst = modrm_reg(mp), src = modrm_rm(mp);
+            if (mp + 1 + 4 > len) { fail(); continue; }
+            int32_t imm = read_i32(&code[mp + 1]);
+            ins.length = (p - pos) + 2 + 4;
+            ins.text = std::string("imul ") + reg64_name(dst) + ", " + reg64_name(src) + ", " + dec_i64(imm);
             out.push_back(ins);
             pos += ins.length;
             continue;

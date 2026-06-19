@@ -1,9 +1,12 @@
-// fuzz_imp — IMPERATIVE + ARRAY-WRITE differential fuzzer for the Helix backend.
+// fuzz_imp — IMPERATIVE (array READS + WRITES) differential fuzzer for the Helix backend.
 //
 // Generates random WELL-FORMED programs in Helix's *imperative* surface language
-// (mutable `var`, assignment, `while`, statement-`if`/`else`, array READS `a[i]`
-// and array WRITES `a[j] = expr`) and checks that the three engines agree on BOTH
-// the function's return value AND the post-execution contents of a REAL int64 array:
+// (mutable `var`, assignment, `while`, statement-`if`/`else`, in-bounds array READS
+// `a[i]` AND in-bounds array WRITES `a[i] = expr`) and checks that the three engines
+// agree on BOTH the function's return value AND the post-execution contents of a REAL
+// int64 array. With writes enabled the array generally diverges from the input, but all
+// three engines must produce the SAME final array (a misordered/dropped/duplicated store
+// shows up as a divergence between engines):
 //
 //     eval_func        — the reference interpreter (the oracle)
 //     jit_compile      — simple, always-correct memory-backed codegen
@@ -15,7 +18,7 @@
 //         var acc = <expr>;            // a few mutable scalar decls
 //         var i = 0;
 //         while i < n {                // outer counted loop (counter strictly ++)
-//             ... body stmts: assigns, a[i]=expr, nested if/else,
+//             ... body stmts: scalar assigns (RHS may read a[i]), nested if/else,
 //                 optionally a nested `while j < n-1 { ... }` ...
 //             i = i + 1;
 //         }
@@ -71,14 +74,18 @@
 //
 // Run: fuzz_imp.exe [seed] [programs]
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
+#include "fuzz_watchdog.hpp"
 #include "helix/backend.hpp"
 #include "helix/eval.hpp"
 #include "helix/front.hpp"
@@ -200,21 +207,28 @@ struct Gen {
 
     // Emit one straight-line body statement (no loops). `ind` is indentation.
     // Appends to `out`. Assignment targets come ONLY from env.muts (so `n` and loop
-    // counters are never reassigned). May write the array in-bounds and read it.
+    // counters are never reassigned). Array WRITES `a[idx] = expr` are emitted inside
+    // loops with an in-bounds `idx` (same in-[0,n) guarantee as reads); the differential
+    // driver checks the post-run array contents, so a misordered/dropped/duplicated store
+    // shows up as an array divergence between engines.
     void emit_stmt(std::string& out, const Env& env, const std::string& ind, int depth) {
         int dd = depth - 1 < 0 ? 0 : depth - 1;
         bool can_assign = !env.muts.empty();
-        bool can_write = !env.idx.empty();
+        // Nothing to emit if there is no assignable scalar in scope (shouldn't happen:
+        // emit_func always introduces at least one accumulator before any loop body).
+        if (!can_assign) return;
+        // Array write (only inside a loop, where an in-bounds index exists).
+        if (!env.idx.empty() && chance(30)) {
+            out += ind + env.ptr + "[" + index_of(env) + "] = " + expr(env, depth) + ";\n";
+            return;
+        }
         int k = range(0, 9);
-        if (k <= 4 && can_assign) {
-            // assignment to an existing mutable scalar accumulator
+        if (k <= 6) {
+            // assignment to an existing mutable scalar accumulator (RHS may read a[i])
             const std::string& v = env.muts[range(0, (int)env.muts.size() - 1)];
             out += ind + v + " = " + expr(env, depth) + ";\n";
-        } else if (k <= 6 && can_write) {
-            // array write a[<in-bounds>] = expr
-            out += ind + env.ptr + "[" + index_of(env) + "] = " + expr(env, depth) + ";\n";
-        } else if (k <= 8 && (can_assign || can_write)) {
-            // statement-if (optionally with else) that conditionally assigns / writes
+        } else {
+            // statement-if (optionally with else) that conditionally assigns a scalar
             std::string c = cond_expr(env, dd);
             out += ind + "if " + c + " {\n";
             emit_stmt(out, env, ind + "  ", dd);
@@ -225,11 +239,6 @@ struct Gen {
                 out += ind + "}";
             }
             out += "\n";
-        } else if (can_assign) {
-            const std::string& v = env.muts[range(0, (int)env.muts.size() - 1)];
-            out += ind + v + " = " + expr(env, depth) + ";\n";
-        } else if (can_write) {
-            out += ind + env.ptr + "[" + index_of(env) + "] = " + expr(env, depth) + ";\n";
         }
     }
 
@@ -354,6 +363,9 @@ int main(int argc, char** argv) {
     // and is skipped (never compared) as a backstop.
     const long kFuel = 200'000'000;
 
+    FuzzWatchdog wd;
+    wd.start();
+
     Stats st;
     bool found = false;
     std::string repro_src, repro_detail;
@@ -411,8 +423,17 @@ int main(int argc, char** argv) {
             a2 = in;
             std::vector<int64_t> args1 = {addr_of(a1.data()), n};
             std::vector<int64_t> args2 = {addr_of(a2.data()), n};
+
+            // Arm the watchdog around the JIT calls (3s >> any real trip count, n<=kMaxN);
+            // a blown deadline means a backend looped forever -> repro + fast process exit.
+            {
+                std::string ctx = "function " + name + " n=" + std::to_string(n) + "\ninput:";
+                for (int i = 0; i < (int)n; i++) ctx += " " + std::to_string((long long)in[i]);
+                wd.arm(src, std::move(ctx), 3000);
+            }
             int64_t sv = simple.call(f, args1);
             int64_t rv = ra.call(f, args2);
+            wd.disarm();
             st.cases_run++;
 
             bool ret_ok = (sv == er.value) && (rv == er.value);

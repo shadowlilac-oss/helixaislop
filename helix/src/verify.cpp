@@ -35,19 +35,37 @@ struct Verifier {
 
     void fail(const std::string& m) { res.ok = false; res.errors.push_back(m); }
 
-    // DFS: collect reachable set + detect cycles (Invariant A).
-    void dfs(NodeId v) {
-        if (reached.count(v)) return;
-        if (on_stack.count(v)) { fail("cycle detected at node " + std::to_string(v)); return; }
-        on_stack.insert(v);
-        std::vector<NodeId> succ;
-        successors(w, v, succ);
-        for (NodeId s : succ) {
-            if (s == NONE || s >= w.node_count()) { fail("dangling operand at node " + std::to_string(v)); continue; }
-            dfs(s);
+    // DFS: collect reachable set + detect cycles (Invariant A). Iterative (explicit
+    // stack) so a deep graph cannot overflow the C++ stack — this runs inside codegen
+    // and the fuzzers on arbitrarily large generated graphs.
+    void dfs(NodeId root) {
+        if (root == NONE || root >= w.node_count()) { fail("dangling root operand"); return; }
+        std::vector<std::pair<NodeId, size_t>> stk;
+        std::vector<std::vector<NodeId>> kids;
+        auto enter = [&](NodeId v) {
+            if (reached.count(v)) return;
+            if (on_stack.count(v)) { fail("cycle detected at node " + std::to_string(v)); return; }
+            on_stack.insert(v);
+            std::vector<NodeId> s;
+            successors(w, v, s);
+            stk.push_back({v, 0});
+            kids.push_back(std::move(s));
+        };
+        enter(root);
+        while (!stk.empty()) {
+            auto& [v, ci] = stk.back();
+            std::vector<NodeId>& s = kids.back();
+            if (ci < s.size()) {
+                NodeId nx = s[ci++];
+                if (nx == NONE || nx >= w.node_count()) { fail("dangling operand at node " + std::to_string(v)); continue; }
+                enter(nx);
+                continue;
+            }
+            on_stack.erase(v);
+            reached.insert(v);
+            stk.pop_back();
+            kids.pop_back();
         }
-        on_stack.erase(v);
-        reached.insert(v);
     }
 
     void check_regions() {

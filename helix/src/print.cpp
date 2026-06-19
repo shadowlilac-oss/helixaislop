@@ -12,8 +12,12 @@ struct Printer {
     std::unordered_map<NodeId, std::string> id_;
     std::unordered_set<NodeId> printed_;
     int ctr_ = 0;
+    int depth_ = 0;                          // ensure() recursion depth
+    static constexpr int kMaxDepth = 4000;   // beyond this, elide rather than overflow
 
     explicit Printer(World& world) : w(world) {}
+
+    struct Dep { int& d; explicit Dep(int& x) : d(x) { ++x; } ~Dep() { --d; } };
 
     std::string name(NodeId v) {
         auto it = id_.find(v);
@@ -34,6 +38,13 @@ struct Printer {
 
     void ensure(NodeId v, int level) {
         if (printed_.count(v)) return;
+        Dep dp(depth_);
+        if (depth_ > kMaxDepth) {  // diagnostic printer: elide instead of overflowing
+            printed_.insert(v);
+            ind(level);
+            out += "/* ...elided (nesting too deep) */\n";
+            return;
+        }
         const Node& n = w.node(v);
         if (n.op == Op::ConstInt || n.op == Op::ConstBool || n.op == Op::Param) {
             printed_.insert(v);

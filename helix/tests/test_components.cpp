@@ -27,6 +27,11 @@ TEST("disasm: decodes the full encoder instruction set with exact lengths") {
     a.test_rr(RAX, RAX);
     a.setcc(CC_L); a.movzx_al(RAX);
     a.movsxd(RAX, RBX);
+    a.movsx8(RAX, RCX); a.movsx16(RDX, RBX);            // narrow sign-extends (i8/i16)
+    a.alu_ri(Alu::Add, RAX, 100); a.alu_ri(Alu::Cmp, RBX, -7);  // ALU r/m, imm32
+    a.shift_ri(Shift::Shl, RAX, 3);                     // shift by constant
+    a.imul_rri(RAX, RCX, 9);                            // imul r, r, imm32
+    a.store_rsp(32, RAX); a.load_rsp(RDX, 40);          // outgoing/incoming stack args
     a.cmovcc(CC_NE, RAX, RCX);
     Label l = a.new_label();
     a.jcc(CC_E, l);
@@ -43,16 +48,13 @@ TEST("disasm: decodes the full encoder instruction set with exact lengths") {
     int known = 0;
     for (auto& i : ins) { total += i.length; if (i.valid) known++; }
     CHECK_EQ((long)total, (long)a.bytes().size());
-    CHECK(known >= (int)ins.size() - 3);  // at most a few opcodes unnamed by the tool
+    CHECK_EQ(known, (int)ins.size());  // EVERY form the encoder emits is now decoded
 
-    // Spot-check a few mnemonics are recognized (format-agnostic substring checks).
+    // Spot-check mnemonics are recognized (format-agnostic substring checks).
     auto has = [&](const char* m) {
         for (auto& i : ins) if (i.text.find(m) != std::string::npos) return true;
         return false;
     };
-    CHECK(has("mov"));
-    CHECK(has("add"));
-    CHECK(has("imul"));
-    CHECK(has("ret"));
-    CHECK(has("call"));
+    for (const char* m : {"mov", "add", "imul", "ret", "call", "movsx", "shl", "cmp", "[rsp"})
+        CHECK(has(m));
 }

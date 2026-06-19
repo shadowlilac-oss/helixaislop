@@ -6,6 +6,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#include "helix/schedule.hpp"
+#include "helix/verify.hpp"
 #include "helix/x64.hpp"
 
 namespace helix {
@@ -16,6 +18,17 @@ constexpr Reg kArgRegs[4] = {RCX, RDX, R8, R9};
 struct CompileError {
     std::string msg;
 };
+
+#ifndef NDEBUG
+// Debug/CI builds verify each function's graph before compiling it, so the fuzzers
+// (which call the backends directly) exercise the verifier on every generated program.
+static void verify_in_debug(World& w, NodeId f) {
+    VerifyResult vr = verify_func(w, f);
+    if (!vr.ok)
+        throw CompileError{"verifier rejected '" + w.func_info(f).name + "'" +
+                           (vr.errors.empty() ? "" : ": " + vr.errors[0])};
+}
+#endif
 
 // Generates one function's machine code into an Asm, using a memory-backed
 // virtual-register model (every value has a home stack slot). Correct for
@@ -28,8 +41,10 @@ struct FuncGen {
     std::unordered_set<NodeId> computed_;
     std::unordered_set<NodeId> multi_emitted_;                       // multi-result loops emitted
     std::unordered_map<NodeId, std::vector<int32_t>> loop_result_slots_;  // loop -> result slots
+    Schedule sched_;                                     // GCM placement: node -> region
     std::vector<std::pair<size_t, NodeId>> call_relocs;  // (imm offset, target func)
     int slot_count = 0;
+    int max_stack_args_ = 0;  // most stack-passed (5th+) args across this fn's calls
     size_t sub_rsp_imm_pos = 0;
 
     FuncGen(World& world, NodeId f) : w(world), func(f) {}
@@ -43,29 +58,39 @@ struct FuncGen {
     }
     int32_t anon_slot() { return -8 * (++slot_count); }
 
-    // Sign-extend a narrow integer result in `r` to its declared width (so i32
-    // wraps like the interpreter's trunc()). i64/bool need no fixup.
+    // Sign-extend a narrow integer result in `r` to its declared width (so i8/i16/i32
+    // wrap like the interpreter's trunc()). i64/bool need no fixup.
     void narrow(Reg r, Type t) {
-        if (t.kind == TyKind::Int && t.bits == 32) a.movsxd(r, r);
+        if (t.kind != TyKind::Int) return;
+        if (t.bits == 8) a.movsx8(r, r);
+        else if (t.bits == 16) a.movsx16(r, r);
+        else if (t.bits == 32) a.movsxd(r, r);
     }
 
     void run() {
         const FuncInfo& fi = w.func_info(func);
-        if (fi.params.size() > 4) throw CompileError{"more than 4 params unsupported"};
+        if (fi.params.size() > 8) throw CompileError{"more than 8 params unsupported"};
 
         a.push_rbp();
         a.mov_rbp_rsp();
         a.sub_rsp(0);  // placeholder; patched after we know slot_count
         sub_rsp_imm_pos = a.size() - 4;
 
-        // store incoming arg registers into param slots (sign-extending narrow ints)
+        // Move incoming args into param slots (sign-extending narrow ints). Args 0-3
+        // arrive in registers; args 4+ arrive on the stack at [rbp + 16 + 8*i] (Win64:
+        // above the saved rbp, the return address, and the caller's 32-byte shadow area).
         for (size_t i = 0; i < fi.params.size(); i++) {
-            if (fi.param_types[i].kind == TyKind::Int && fi.param_types[i].bits == 32)
-                a.movsxd(kArgRegs[i], kArgRegs[i]);
-            a.store(slot(fi.params[i]), kArgRegs[i]);
+            Reg src = (i < 4) ? kArgRegs[i] : RAX;
+            if (i >= 4) a.load(RAX, 16 + 8 * (int)i);
+            narrow(src, fi.param_types[i]);  // sign-extend a narrow-typed incoming arg
+            a.store(slot(fi.params[i]), src);
             computed_.insert(fi.params[i]);
         }
 
+        // Global Code Motion: place every value in the region that dominates all its
+        // uses, then emit each region's nodes once at the correct program point.
+        sched_ = build_schedule(w, func);
+        emit_region(sched_.post[sched_.root]);
         emit_value(fi.result);
         if (fi.state_result != NONE) emit_value(fi.state_result);  // emit pending memory writes
         a.load(RAX, slot(fi.result));
@@ -73,8 +98,8 @@ struct FuncGen {
         a.pop_rbp();
         a.ret();
 
-        // patch frame size = align16(slots*8 + 32 shadow)
-        int32_t frame = (int32_t)(((slot_count * 8 + 32) + 15) & ~15);
+        // patch frame size = align16(slots*8 + 32 shadow + outgoing stack-arg area)
+        int32_t frame = (int32_t)(((slot_count * 8 + 32 + max_stack_args_ * 8) + 15) & ~15);
         auto& b = a.bytes();
         for (int i = 0; i < 4; i++) b[sub_rsp_imm_pos + i] = (uint8_t)((uint32_t)frame >> (8 * i));
         a.finalize();
@@ -225,102 +250,65 @@ struct FuncGen {
         a.store(slot(v), RAX);
     }
 
+    // Emit every node the scheduler assigned to one region, in topological order.
+    void emit_region(const std::vector<NodeId>& nodes) {
+        for (NodeId nd : nodes) emit_value(nd);
+    }
+
     void emit_cond(NodeId v) {
         const Node& n = w.node(v);
         const CondInfo& ci = w.cond_info(v);
         if (ci.yields.size() != 2) throw CompileError{"backend supports binary cond only"};
-        emit_value(n.ins[0]);  // predicate
+        emit_value(n.ins[0]);  // predicate (already materialized in the enclosing region)
         a.load(RAX, slot(n.ins[0]));
         a.test_rr(RAX, RAX);
         Label els = a.new_label(), end = a.new_label();
         a.jcc(CC_E, els);  // pred == 0 -> else (yields[0])
-        // then = yields[1]
-        computed_.clear();
+        // then = yields[1]: emit the arm's region, then the yield value
+        emit_region(sched_.post[sched_.cond_arm1.at(v)]);
         emit_value(ci.yields[1]);
         a.load(RAX, slot(ci.yields[1]));
         a.store(slot(v), RAX);
         a.jmp(end);
         // else = yields[0]
         a.bind(els);
-        computed_.clear();
+        emit_region(sched_.post[sched_.cond_arm0.at(v)]);
         emit_value(ci.yields[0]);
         a.load(RAX, slot(ci.yields[0]));
         a.store(slot(v), RAX);
         a.bind(end);
-        computed_.clear();
     }
 
-    void emit_loop(NodeId v) {
+    // Materialize the loop's carried params, run the body once in machine code (it
+    // loops at run time), with the schedule split around the exit test: the is_break
+    // cone (pre[body]) is emitted BEFORE the test every iteration; the next-value cone
+    // (post[body]) AFTER it, so body loads never execute on the exiting round.
+    void emit_loop_common(NodeId v, std::vector<int32_t>* result_slots) {
         const Node& n = w.node(v);
         const LoopInfo& li = w.loop_info(v);
         const size_t k = li.params.size();
-        // init carried params
-        for (size_t i = 0; i < k; i++) {
+        int body = sched_.loop_body.at(v);
+        for (size_t i = 0; i < k; i++) {  // init carried params (inits live in parent region)
             emit_value(n.ins[i]);
             a.load(RAX, slot(n.ins[i]));
             a.store(slot(li.params[i]), RAX);
             computed_.insert(li.params[i]);
         }
-        // temp slots for parallel move
         std::vector<int32_t> temps(k);
         for (size_t i = 0; i < k; i++) temps[i] = anon_slot();
 
         Label top = a.new_label(), brk = a.new_label();
         a.bind(top);
-        computed_.clear();
         for (size_t i = 0; i < k; i++) computed_.insert(li.params[i]);  // params live in slots
 
+        emit_region(sched_.pre[body]);  // is_break / break-value cone (before the test)
         emit_value(li.is_break);
         a.load(RAX, slot(li.is_break));
         a.test_rr(RAX, RAX);
         a.jcc(CC_NE, brk);  // is_break != 0 -> exit
 
-        // compute all next values (reading current params), then parallel-move into params
-        for (size_t i = 0; i < k; i++) {
-            emit_value(li.next_vals[i]);
-            a.load(RAX, slot(li.next_vals[i]));
-            a.store(temps[i], RAX);
-        }
-        for (size_t i = 0; i < k; i++) {
-            a.load(RAX, temps[i]);
-            a.store(slot(li.params[i]), RAX);
-        }
-        a.jmp(top);
-
-        a.bind(brk);
-        computed_.clear();
-        for (size_t i = 0; i < k; i++) computed_.insert(li.params[i]);
-        emit_value(li.break_val);
-        a.load(RAX, slot(li.break_val));
-        a.store(slot(v), RAX);
-        computed_.clear();
-    }
-
-    // Multi-result loop: emit once, leaving each break value in its own result slot.
-    void emit_loop_multi(NodeId v) {
-        if (multi_emitted_.count(v)) return;
-        multi_emitted_.insert(v);
-        const Node& n = w.node(v);
-        const LoopInfo& li = w.loop_info(v);
-        const size_t k = li.params.size();
-        for (size_t i = 0; i < k; i++) {
-            emit_value(n.ins[i]);
-            a.load(RAX, slot(n.ins[i]));
-            a.store(slot(li.params[i]), RAX);
-            computed_.insert(li.params[i]);
-        }
-        std::vector<int32_t> temps(k);
-        for (size_t i = 0; i < k; i++) temps[i] = anon_slot();
-
-        Label top = a.new_label(), brk = a.new_label();
-        a.bind(top);
-        computed_.clear();
-        for (size_t i = 0; i < k; i++) computed_.insert(li.params[i]);
-        emit_value(li.is_break);
-        a.load(RAX, slot(li.is_break));
-        a.test_rr(RAX, RAX);
-        a.jcc(CC_NE, brk);
-        for (size_t i = 0; i < k; i++) {
+        emit_region(sched_.post[body]);  // body + next-value cone (after the test)
+        for (size_t i = 0; i < k; i++) {  // parallel move next_vals -> params
             emit_value(li.next_vals[i]);
             a.load(RAX, slot(li.next_vals[i]));
             a.store(temps[i], RAX);
@@ -329,25 +317,44 @@ struct FuncGen {
         a.jmp(top);
 
         a.bind(brk);
-        computed_.clear();
-        for (size_t i = 0; i < k; i++) computed_.insert(li.params[i]);
-        std::vector<int32_t> rslots;
-        for (NodeId bvn : li.break_vals) {
-            emit_value(bvn);
-            a.load(RAX, slot(bvn));
-            int32_t rs = anon_slot();
-            a.store(rs, RAX);
-            rslots.push_back(rs);
+        if (result_slots) {  // multi-result: leave each break value in its own slot
+            for (NodeId bvn : li.break_vals) {
+                emit_value(bvn);
+                a.load(RAX, slot(bvn));
+                int32_t rs = anon_slot();
+                a.store(rs, RAX);
+                result_slots->push_back(rs);
+            }
+        } else {  // single-result: store break_val into the loop node's slot
+            emit_value(li.break_val);
+            a.load(RAX, slot(li.break_val));
+            a.store(slot(v), RAX);
         }
-        computed_.clear();
+    }
+
+    void emit_loop(NodeId v) { emit_loop_common(v, nullptr); }
+
+    void emit_loop_multi(NodeId v) {
+        if (multi_emitted_.count(v)) return;
+        multi_emitted_.insert(v);
+        std::vector<int32_t> rslots;
+        emit_loop_common(v, &rslots);
         loop_result_slots_[v] = std::move(rslots);
     }
 
     void emit_call(NodeId v) {
         const Node& n = w.node(v);
-        if (n.ins.size() > 4) throw CompileError{"more than 4 call args unsupported"};
+        if (n.ins.size() > 8) throw CompileError{"more than 8 call args unsupported"};
         for (NodeId arg : n.ins) emit_value(arg);
-        for (size_t i = 0; i < n.ins.size(); i++) a.load(kArgRegs[i], slot(n.ins[i]));
+        int stack_args = (int)n.ins.size() > 4 ? (int)n.ins.size() - 4 : 0;
+        if (stack_args > max_stack_args_) max_stack_args_ = stack_args;
+        // outgoing stack args (5th+) into the callee arg area at [rsp + 32 + 8*(i-4)]
+        for (size_t i = 4; i < n.ins.size(); i++) {
+            a.load(RAX, slot(n.ins[i]));
+            a.store_rsp(32 + 8 * (int)(i - 4), RAX);
+        }
+        // register args 0-3
+        for (size_t i = 0; i < n.ins.size() && i < 4; i++) a.load(kArgRegs[i], slot(n.ins[i]));
         // mov rax, <abs target placeholder>; record reloc; call rax
         size_t pos0 = a.size();
         a.mov_ri(RAX, 0);
@@ -379,13 +386,12 @@ JitModule& JitModule::operator=(JitModule&& o) noexcept {
 int64_t JitModule::call(NodeId func, const std::vector<int64_t>& args) const {
     auto it = entries_.find(func);
     if (it == entries_.end()) return 0;
-    using Fn = int64_t (*)(int64_t, int64_t, int64_t, int64_t);
+    // Always call through an 8-arg pointer (Win64 caller-cleanup: extra args a callee
+    // ignores are harmless), so functions with up to 8 params work uniformly.
+    using Fn = int64_t (*)(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
     Fn f = reinterpret_cast<Fn>((uint8_t*)mem_ + it->second);
-    int64_t a0 = args.size() > 0 ? args[0] : 0;
-    int64_t a1 = args.size() > 1 ? args[1] : 0;
-    int64_t a2 = args.size() > 2 ? args[2] : 0;
-    int64_t a3 = args.size() > 3 ? args[3] : 0;
-    return f(a0, a1, a2, a3);
+    auto A = [&](size_t i) -> int64_t { return i < args.size() ? args[i] : 0; };
+    return f(A(0), A(1), A(2), A(3), A(4), A(5), A(6), A(7));
 }
 
 JitModule jit_compile(World& w) {
@@ -395,6 +401,9 @@ JitModule jit_compile(World& w) {
 
     try {
         for (NodeId f : w.module_funcs()) {
+#ifndef NDEBUG
+            verify_in_debug(w, f);  // the graph we are about to compile must be well-formed
+#endif
             func_index[f] = gens.size();
             gens.emplace_back(w, f);
             gens.back().run();

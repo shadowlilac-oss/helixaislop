@@ -172,6 +172,8 @@ public:
     // module
     void add_func(NodeId f) { module_funcs_.push_back(f); }
     const std::vector<NodeId>& module_funcs() const { return module_funcs_; }
+    // Dead-function elimination: retain only the functions in `keep` (order preserved).
+    void keep_funcs(const std::vector<NodeId>& keep);
     NodeId find_func(const std::string& name) const;
 
     // stats

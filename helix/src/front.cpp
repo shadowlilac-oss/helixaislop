@@ -14,7 +14,7 @@ namespace {
 enum class Tok {
     End, Ident, Int,
     KwFn, KwComptime, KwLet, KwVar, KwIf, KwElse, KwLoop, KwWhile, KwBreak, KwNext, KwReturn,
-    KwTrue, KwFalse, KwIntTy, KwI64, KwI32, KwBool,
+    KwTrue, KwFalse, KwIntTy, KwI64, KwI32, KwI16, KwI8, KwBool,
     LParen, RParen, LBrace, RBrace, LBracket, RBracket, Comma, Semi, Colon, Arrow, Assign,
     Plus, Minus, Star, Slash, Percent,
     Amp, Pipe, Caret, Shl, Shr,
@@ -39,6 +39,10 @@ struct Lexer {
 
     std::vector<Token> lex() {
         std::vector<Token> out;
+        // Skip a leading UTF-8 BOM (EF BB BF) if present, so editor-saved files lex.
+        if (s.size() >= 3 && (unsigned char)s[0] == 0xEF && (unsigned char)s[1] == 0xBB &&
+            (unsigned char)s[2] == 0xBF)
+            i = 3;
         for (;;) {
             skip_ws();
             if (i >= s.size()) { out.push_back({Tok::End, "", 0, line}); break; }
@@ -82,6 +86,8 @@ struct Lexer {
         else if (t == "int") k = Tok::KwIntTy;
         else if (t == "i64") k = Tok::KwI64;
         else if (t == "i32") k = Tok::KwI32;
+        else if (t == "i16") k = Tok::KwI16;
+        else if (t == "i8") k = Tok::KwI8;
         else if (t == "bool") k = Tok::KwBool;
         return {k, t, 0, line};
     }
@@ -161,6 +167,8 @@ struct Parser {
     std::unordered_set<std::string> mutables;           // names declared with `var`
     bool func_has_stores = false;                       // current fn writes memory -> thread $mem
     Type cur_result_ty = ty_i64();
+    int depth_ = 0;                                      // recursive-descent nesting depth
+    static constexpr int kMaxDepth = 600;               // deep input -> parse error, not a crash
     using Env = std::unordered_map<std::string, NodeId>;
 
     explicit Parser(World& world) : w(world) {}
@@ -168,6 +176,13 @@ struct Parser {
     [[noreturn]] void err(const std::string& m) {
         throw std::pair<std::string, int>{m, toks[p < toks.size() ? p : toks.size() - 1].line};
     }
+    // RAII recursion guard: pathologically nested input fails as a parse error rather
+    // than overflowing the C++ stack in the recursive-descent parser.
+    struct Rec {
+        Parser* s;
+        explicit Rec(Parser* p) : s(p) { if (++p->depth_ > kMaxDepth) p->err("nesting too deep"); }
+        ~Rec() { --s->depth_; }
+    };
     const Token& cur() { return toks[p]; }
     bool is(Tok k) { return toks[p].kind == k; }
     bool accept(Tok k) { if (is(k)) { p++; return true; } return false; }
@@ -176,6 +191,8 @@ struct Parser {
     Type parse_type() {
         if (accept(Tok::KwIntTy) || accept(Tok::KwI64)) return ty_i64();
         if (accept(Tok::KwI32)) return ty_i32();
+        if (accept(Tok::KwI16)) return ty_int(16);
+        if (accept(Tok::KwI8)) return ty_int(8);
         if (accept(Tok::KwBool)) return ty_bool();
         if (is(Tok::Ident) && cur().text == "ptr") { p++; return ty_ptr(); }  // ptr = *i64
         err("expected type");
@@ -244,14 +261,17 @@ struct Parser {
         cur_result_ty = h.result_type;
         env.clear();
         mutables.clear();
-        // Array WRITES (a[i]=v) are disabled: the threaded-state effect lowering had
-        // ordering miscompiles (found by fuzzing) that require region-port state
-        // threading to fix correctly. Reads (a[i], pure loads) remain supported.
-        func_has_stores = false;
+        // Array WRITES (a[i]=v): a linear memory-state token ($mem) is threaded through
+        // loads and stores so memory ops stay ordered (RAW/WAR). The Global Code Motion
+        // scheduler places each store exactly once, in state (topological) order, and
+        // never speculates one past a guard — which is what makes this correct.
+        func_has_stores = scan_has_stores(h.body_begin, h.body_end);
         for (size_t i = 0; i < h.param_names.size(); i++) bind(h.param_names[i], fi.params[i]);
+        if (func_has_stores) env["$mem"] = w.mem_start();  // initial linear memory state
         p = h.body_begin;
         NodeId v = parse_stmt_block();  // statements + tail/return value
-        w.end_func(h.node, v);
+        NodeId sresult = func_has_stores ? env["$mem"] : NONE;
+        w.end_func(h.node, v, sresult);  // state_result forces all pending writes to emit
     }
 
     bool peek_assign() {
@@ -271,6 +291,7 @@ struct Parser {
 
     // Parse a `{ stmt* tail? }` block; returns the tail (or `return`) value, NONE if void.
     NodeId parse_stmt_block() {
+        Rec rec(this);
         expect(Tok::LBrace, "{");
         NodeId tail = NONE;
         while (!is(Tok::RBrace) && !is(Tok::End)) {
@@ -299,7 +320,20 @@ struct Parser {
                 accept(Tok::Semi);
                 continue;
             }
-            if (peek_store()) err("array writes (a[i] = v) are not supported in this build");
+            if (peek_store()) {  // a[i] = v  ->  store(a + i*8, v) on the $mem chain
+                std::string name = cur().text; p++;
+                NodeId base = lookup(name);
+                if (base == NONE) err("unknown identifier '" + name + "'");
+                expect(Tok::LBracket, "[");
+                NodeId idx = parse_expr(0);          // index (may itself read a[..])
+                expect(Tok::RBracket, "]");
+                expect(Tok::Assign, "=");
+                NodeId val = parse_expr(0);           // value (evaluated before the write)
+                expect(Tok::Semi, ";");
+                NodeId addr = w.add(base, w.mul(idx, w.konst(8, ty_i64())));
+                env["$mem"] = w.store(addr, val, env["$mem"]);
+                continue;
+            }
             if (peek_assign()) {
                 std::string name = cur().text; p++;
                 expect(Tok::Assign, "=");
@@ -424,6 +458,7 @@ struct Parser {
     }
 
     NodeId parse_expr(int min_bp) {
+        Rec rec(this);
         NodeId lhs = parse_unary();
         for (;;) {
             int bp = lbp(cur().kind);
@@ -436,6 +471,7 @@ struct Parser {
     }
 
     NodeId parse_unary() {
+        Rec rec(this);
         if (accept(Tok::Minus)) return w.neg(parse_unary());
         if (accept(Tok::Bang)) return w.cmp(Op::CmpEq, parse_unary(), w.konst_bool(false));
         NodeId v = parse_primary();

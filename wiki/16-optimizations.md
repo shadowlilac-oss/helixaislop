@@ -2,6 +2,8 @@
 
 _Most Helix optimizations are not passes. They are either **emergent** from the graph form (hash-consing, single-origin edges, the pure/state split) or expressed as a handful of **declarative rules** in the shared DSL. This page catalogues them, shows the mechanism behind each, and is honest about what this buys (a far smaller codebase that **matches** the best graph IRs — not a claim to beat `-O3` output quality, R1)._
 
+> **⚠️ Design vs. built** (see [24-implementation-status](24-implementation-status.md), [25-path-to-production](25-path-to-production.md)). This chapter describes the *intended* optimizer. **Built today:** Tier-1 construction-time folding (~15 algebraic identities, one strength-reduction rule), hash-cons CSE, the GCM scheduler, and function inlining (wired behind `helixc -O`, differential-fuzzed). **Not built:** the declarative / SMT-verified rule DSL and the Tier-2 equality-saturation overlay (every rule is a hand-written C++ smart-constructor case), cross-control-flow GVN/PRE, SCCP/range analysis, LICM/unroll/TRE, and all memory optimizations (they need the unbuilt multi-state model). The "matches the best graph IRs" claim has **not** been benchmarked against LLVM/GCC.
+
 > Prerequisites: [Core Model](11-core-model.md) (the six node forms, the two strands), [Reduction Engine](14-reduction-engine.md) (Tier-1 eager normalization, Tier-2 bounded overlay), and [Comptime](15-comptime.md) (the specialize-a-region primitive). This page assumes that vocabulary.
 
 ---

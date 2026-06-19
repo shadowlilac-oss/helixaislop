@@ -27,7 +27,8 @@
 //   * Recursion is guarded by `if (n <= 0) { base } else { ... f(n-1) ... }` and
 //     the recursion argument strictly decreases, with small initial magnitude, so
 //     native JIT recursion terminates at shallow depth.
-//   * Functions have <= 4 params and calls have <= 4 args (backend ABI limit).
+//   * Functions have <= 8 params and calls have <= 8 args (Win64: 4 in registers, the
+//     5th+ passed on the stack); this exercises the stack-argument ABI path.
 //
 // Build (isolated), linking the four sources:
 //   msvc.bat /nologo /EHsc /std:c++20 /I include tools/fuzz_cf.cpp \
@@ -41,6 +42,7 @@
 #include <string>
 #include <vector>
 
+#include "fuzz_watchdog.hpp"
 #include "helix/backend.hpp"
 #include "helix/eval.hpp"
 #include "helix/front.hpp"
@@ -241,7 +243,7 @@ struct Gen {
     // Emit one function. Returns its source text and records its signature.
     std::string emit_func(const std::string& name, std::vector<FnSig>& fns) {
         next_tmp = 0;
-        int nparams = range(1, 4);
+        int nparams = range(1, 8);  // up to 8 params: exercises Win64 stack-passed args (5th+)
         bool recursive = chance(40);
 
         Env env;
@@ -324,6 +326,9 @@ int main(int argc, char** argv) {
     // on cases the interpreter ran to completion.
     const long kFuel = 1'000'000;
 
+    FuzzWatchdog wd;
+    wd.start();
+
     bool found_mismatch = false;
     std::string repro_src;
     std::string repro_detail;
@@ -388,7 +393,15 @@ int main(int argc, char** argv) {
                     continue;  // skip cases the interpreter couldn't finish
                 }
 
+                {  // watchdog: interp already terminated, so a hung JIT call is a real bug
+                    std::string ctx = "function " + fs.name + " args=[";
+                    for (size_t i = 0; i < args.size(); i++)
+                        ctx += (i ? ", " : "") + std::to_string((long long)args[i]);
+                    ctx += "]";
+                    wd.arm(src, std::move(ctx), 3000);
+                }
                 int64_t jv = jit.call(f, args);
+                wd.disarm();
                 st.cases_run++;
 
                 if (jv != er.value) {

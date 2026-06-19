@@ -8,6 +8,7 @@
 #include "helix/front.hpp"
 #include "helix/ir.hpp"
 #include "helix/opt.hpp"
+#include "helix/verify.hpp"
 #include "test.hpp"
 
 using namespace helix;
@@ -79,6 +80,34 @@ TEST("opt: inlining a function containing a loop stays correct (jit == interp)")
         CHECK(ir.ok);
         CHECK_EQ(ir.value, (int64_t)n * (n - 1));  // 2 * sum(0..n-1)
         CHECK_EQ(jv, ir.value);
+    }
+}
+
+TEST("opt: optimize_module (the -O path) preserves semantics and re-verifies") {
+    const char* src =
+        "fn inc(x: int) -> int { x + 1 }\n"
+        "fn sq(x: int) -> int { x * x }\n"
+        "fn poly(a: int, b: int) -> int { sq(inc(a)) + inc(sq(b)) }\n"
+        "fn rec(n: int) -> int { if (n <= 0) | (n > 12) { n } else { rec(n - 1) + inc(n) } }\n";
+    World wu, wo;  // unoptimized vs optimized copies of the same source
+    CHECK(parse_module(wu, src).ok);
+    CHECK(parse_module(wo, src).ok);
+    optimize_module(wo, 2);
+    CHECK(verify_module(wo).ok);  // the optimized graph must still pass the verifier
+    JitModule ju = jit_compile_ra(wu), jo = jit_compile_ra(wo);
+    CHECK(ju.ok);
+    CHECK(jo.ok);
+    for (const char* fn : {"poly", "rec", "inc", "sq"}) {
+        NodeId fu = wu.find_func(fn), fo = wo.find_func(fn);
+        int np = (std::string(fn) == "poly") ? 2 : 1;
+        for (int64_t a = -6; a <= 13; a++) {
+            std::vector<int64_t> args = np == 2 ? std::vector<int64_t>{a, a + 2} : std::vector<int64_t>{a};
+            auto ir = eval_func(wu, fu, args);
+            CHECK(ir.ok);
+            CHECK_EQ(eval_func(wo, fo, args).value, ir.value);  // opt == unopt (interp)
+            CHECK_EQ(jo.call(fo, args), ir.value);              // opt jit == interp
+            CHECK_EQ(ju.call(fu, args), ir.value);              // unopt jit == interp
+        }
     }
 }
 

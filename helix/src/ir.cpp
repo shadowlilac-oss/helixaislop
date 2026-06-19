@@ -1,6 +1,7 @@
 #include "helix/ir.hpp"
 
 #include <stdexcept>
+#include <unordered_set>
 
 namespace helix {
 
@@ -394,6 +395,14 @@ NodeId World::find_func(const std::string& name) const {
     for (NodeId f : module_funcs_)
         if (funcs_[node(f).region].name == name) return f;
     return NONE;
+}
+
+void World::keep_funcs(const std::vector<NodeId>& keep) {
+    std::unordered_set<NodeId> keepset(keep.begin(), keep.end());
+    std::vector<NodeId> kept;
+    for (NodeId f : module_funcs_)
+        if (keepset.count(f)) kept.push_back(f);  // preserve original order
+    module_funcs_ = std::move(kept);
 }
 
 }  // namespace helix

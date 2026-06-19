@@ -1,0 +1,37 @@
+# Helix CI — build, unit suite, and a differential-fuzz smoke on every push/PR.
+# Makes the "0 mismatches" claim reproducible off one machine (the audit's Tier-0 gap).
+# Requires `git init` + a GitHub remote; the project currently ships without one.
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-test-fuzz:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build, test, and smoke-fuzz
+        working-directory: helix
+        run: ./ci.ps1
+
+  # Longer fuzz campaign on a schedule (not gating PRs).
+  nightly-fuzz:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extended differential fuzz
+        working-directory: helix
+        run: |
+          ./ci.ps1
+          foreach ($s in 11,22,33,44) { ./build/fuzz_imp.exe $s 20000 | Select-String 'mismatches' }
+          foreach ($s in 11,22)       { ./build/fuzz_cf.exe  $s 15000 | Select-String 'mismatches' }

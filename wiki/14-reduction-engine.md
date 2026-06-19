@@ -2,6 +2,8 @@
 
 *The heart of Helix: a two-tier rewrite engine in which optimization, constant folding, comptime evaluation, and instruction selection are all the same process — eager oriented normalization at construction time (Tier 1), with a bounded acyclic equivalence overlay used sparingly for the few choices that have no single canonical best form (Tier 2).*
 
+> **⚠️ Design vs. built** (see [24-implementation-status](24-implementation-status.md), [25-path-to-production](25-path-to-production.md)). **Built today:** Tier-1 eager normalization (folding / identities / strength reduction / commutative-CSE) in the smart constructors. **Not built:** the Tier-2 bounded equivalence (equality-saturation) overlay, and the "one engine for folding + ISel + comptime" unification — in the code, folding is C++ peephole, instruction selection is a separate backend switch, and comptime is a separate tree-walking interpreter (`eval.cpp`) that reifies a single constant (no NbE / neutral terms / residualization).
+
 ---
 
 ## 0. Why this page exists
