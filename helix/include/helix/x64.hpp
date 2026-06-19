@@ -63,6 +63,25 @@ public:
         emit(0x0F); emit(0xAF);
         emit((uint8_t)(0xC0 | ((dst & 7) << 3) | (src & 7)));
     }
+    // reg OP= [rbp+disp32]  (reg, r/m forms: add 03, sub 2B, and 23, or 0B, xor 33, cmp 3B)
+    void alu_rm(Alu k, Reg reg, int32_t disp) {
+        uint8_t op = 0;
+        switch (k) {
+            case Alu::Add: op = 0x03; break;
+            case Alu::Sub: op = 0x2B; break;
+            case Alu::And: op = 0x23; break;
+            case Alu::Or: op = 0x0B; break;
+            case Alu::Xor: op = 0x33; break;
+            case Alu::Cmp: op = 0x3B; break;
+        }
+        mem_rbp(op, reg, disp);
+    }
+    void imul_rm(Reg reg, int32_t disp) {  // reg *= [rbp+disp32]
+        rex(true, reg >= 8, false);
+        emit(0x0F); emit(0xAF);
+        emit((uint8_t)(0x80 | ((reg & 7) << 3) | 5));
+        emit_i32(disp);
+    }
     void shift(Shift k, Reg dst /*count in CL*/) {
         uint8_t ext = k == Shift::Shl ? 4 : (k == Shift::Sar ? 7 : 5);
         rex(true, false, dst >= 8);

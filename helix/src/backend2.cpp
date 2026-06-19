@@ -387,6 +387,18 @@ struct FnEncoder {
         a.ret();
     }
 
+    // Where a vreg lives: a physical register, or a stack spill slot (as [rbp+disp]).
+    struct Loc { bool inreg; Reg r; int32_t disp; };
+    Loc loc(VReg v) const {
+        if (al.reg[v] >= 0) return {true, areg(al.reg[v]), 0};
+        return {false, RAX, spill_disp(al.spill[v])};
+    }
+    // dst OP= b, reading b directly as a register or [memory] operand (no scratch).
+    void alu_v(Alu k, Reg dst, VReg b) {
+        Loc l = loc(b);
+        if (l.inreg) a.alu(k, dst, l.r); else a.alu_rm(k, dst, l.disp);
+    }
+
     void encode(const MInst& in) {
         switch (in.op) {
             case MOp::MovArg: {
@@ -395,24 +407,41 @@ struct FnEncoder {
                 put(in.dst, ar);
                 break;
             }
-            case MOp::MovImm: a.mov_ri(RAX, in.imm); put(in.dst, RAX); break;
-            case MOp::Mov: get(in.a, RAX); put(in.dst, RAX); break;
-            case MOp::Add: alu2(in, Alu::Add); break;
-            case MOp::Sub: alu2(in, Alu::Sub); break;
-            case MOp::And: alu2(in, Alu::And); break;
-            case MOp::Or: alu2(in, Alu::Or); break;
-            case MOp::Xor: alu2(in, Alu::Xor); break;
-            case MOp::Mul:
-                get(in.a, RAX); get(in.b, RCX); a.imul(RAX, RCX); narrow(RAX, in.type); put(in.dst, RAX);
+            case MOp::MovImm: {
+                Loc d = loc(in.dst);
+                if (d.inreg) a.mov_ri(d.r, in.imm);
+                else { a.mov_ri(RAX, in.imm); a.store(d.disp, RAX); }
                 break;
+            }
+            case MOp::Mov: {
+                Loc d = loc(in.dst);
+                if (d.inreg) get(in.a, d.r);  // mov dst, a (elided when already coalesced)
+                else { get(in.a, RAX); a.store(d.disp, RAX); }
+                break;
+            }
+            case MOp::Add: bin2(in, Alu::Add); break;
+            case MOp::Sub: bin2(in, Alu::Sub); break;
+            case MOp::And: bin2(in, Alu::And); break;
+            case MOp::Or: bin2(in, Alu::Or); break;
+            case MOp::Xor: bin2(in, Alu::Xor); break;
+            case MOp::Mul: {
+                Loc d = loc(in.dst);
+                Reg t = d.inreg ? d.r : RAX;
+                get(in.a, t);
+                Loc lb = loc(in.b);
+                if (lb.inreg) a.imul(t, lb.r); else a.imul_rm(t, lb.disp);
+                narrow(t, in.type);
+                if (!d.inreg) a.store(d.disp, t);
+                break;
+            }
             case MOp::Shl: shift2(in, Shift::Shl); break;
             case MOp::Sar: shift2(in, Shift::Sar); break;
             case MOp::Shr: shift2(in, Shift::Shr); break;
-            case MOp::Neg: get(in.a, RAX); a.neg(RAX); narrow(RAX, in.type); put(in.dst, RAX); break;
-            case MOp::Not: get(in.a, RAX); a.not_(RAX); narrow(RAX, in.type); put(in.dst, RAX); break;
+            case MOp::Neg: un2(in, true); break;
+            case MOp::Not: un2(in, false); break;
             case MOp::Div: case MOp::Rem: encode_div(in); break;
             case MOp::SetCmp:
-                get(in.a, RAX); get(in.b, RCX); a.alu(Alu::Cmp, RAX, RCX);
+                get(in.a, RAX); alu_v(Alu::Cmp, RAX, in.b);
                 a.setcc(in.cc); a.movzx_al(RAX); put(in.dst, RAX);
                 break;
             case MOp::Sel:
@@ -428,11 +457,31 @@ struct FnEncoder {
         }
     }
 
-    void alu2(const MInst& in, Alu k) {
-        get(in.a, RAX); get(in.b, RCX); a.alu(k, RAX, RCX); narrow(RAX, in.type); put(in.dst, RAX);
+    // dst = a OP b  ->  compute into dst's register directly: mov dst,a ; op dst,b.
+    void bin2(const MInst& in, Alu k) {
+        Loc d = loc(in.dst);
+        Reg t = d.inreg ? d.r : RAX;
+        get(in.a, t);            // mov t, a  (elided if a is already in t)
+        alu_v(k, t, in.b);       // t OP= b   (b is never in t: both are live here)
+        narrow(t, in.type);
+        if (!d.inreg) a.store(d.disp, t);
     }
     void shift2(const MInst& in, Shift k) {
-        get(in.a, RAX); get(in.b, RCX); a.shift(k, RAX); narrow(RAX, in.type); put(in.dst, RAX);
+        Loc d = loc(in.dst);
+        Reg t = d.inreg ? d.r : RAX;
+        get(in.a, t);
+        get(in.b, RCX);          // count in CL (RCX is scratch, never an alloc reg)
+        a.shift(k, t);
+        narrow(t, in.type);
+        if (!d.inreg) a.store(d.disp, t);
+    }
+    void un2(const MInst& in, bool isneg) {
+        Loc d = loc(in.dst);
+        Reg t = d.inreg ? d.r : RAX;
+        get(in.a, t);
+        if (isneg) a.neg(t); else a.not_(t);
+        narrow(t, in.type);
+        if (!d.inreg) a.store(d.disp, t);
     }
     void encode_div(const MInst& in) {
         get(in.a, RAX); get(in.b, RCX);
