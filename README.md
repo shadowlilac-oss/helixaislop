@@ -1,3 +1,6 @@
+
+# frick claude ai slop, go do your advertising somewhere else, not in my contributor list
+
 # Helix
 
 **A compact, correctness-first compiler IR — and a working compiler built on it.**
