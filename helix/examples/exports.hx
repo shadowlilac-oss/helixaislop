@@ -20,3 +20,17 @@ fn sum_arr(a: ptr, n: int) -> int {
 fn dot(a: ptr, b: ptr, n: int) -> int {
     loop (acc = 0, i = 0) { if i >= n { break acc } else { next acc + a[i] * b[i], i + 1 } }
 }
+
+// In-place bubble sort, written imperatively with mutable variables and array writes.
+fn bubble(a: ptr, n: int) -> int {
+    var i = 0;
+    while i < n {
+        var j = 0;
+        while j < n - 1 {
+            if a[j] > a[j + 1] { var t = a[j]; a[j] = a[j + 1]; a[j + 1] = t; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}

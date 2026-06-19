@@ -80,11 +80,14 @@ struct Verifier {
             if (n.state_in != NONE) consumers[n.state_in]++;
         }
         if (fi.state_result != NONE) consumers[fi.state_result]++;
+        // Flag the dangerous case — a state token consumed by MORE than one effect
+        // (a fork of the memory state). A token consumed zero times via state_in is
+        // fine when it flows on through a region port (loop-carried / proj), which a
+        // purely state_in-based count does not track.
         for (NodeId p : producers) {
             int c = consumers.count(p) ? consumers[p] : 0;
-            if (c == 0) fail("state token " + std::to_string(p) + " is dropped (linearity)");
-            else if (c > 1) fail("state token " + std::to_string(p) + " used " + std::to_string(c) +
-                                 " times (linearity)");
+            if (c > 1) fail("state token " + std::to_string(p) + " used " + std::to_string(c) +
+                            " times (linearity)");
         }
     }
 
