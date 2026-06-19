@@ -73,9 +73,9 @@ struct Verifier {
         if (fi.state_param != NONE) producers.insert(fi.state_param);
         for (NodeId v : reached) {
             const Node& n = w.node(v);
-            // Only Load/Store (and the entry state_param) produce a state token. A Call
-            // may consume state (state_in) but yields no state result in this IR.
-            if (n.op == Op::Load || n.op == Op::Store) producers.insert(v);
+            // Only *effectful* Load/Store (state_in set) produce a state token; a pure
+            // read-only load has no state. A Call may consume state but yields none.
+            if ((n.op == Op::Load || n.op == Op::Store) && n.state_in != NONE) producers.insert(v);
             if (n.state_in != NONE) consumers[n.state_in]++;
         }
         if (fi.state_result != NONE) consumers[fi.state_result]++;

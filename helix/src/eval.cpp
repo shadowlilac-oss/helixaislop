@@ -86,6 +86,11 @@ struct Interp {
             case Op::Call:
                 result = eval_call(id, fr);
                 break;
+            case Op::Load: {  // read-only load via a real pointer
+                int64_t addr = eval(n.ins[0], fr);
+                result = *reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(addr));
+                break;
+            }
             default:
                 result = 0;
                 break;

@@ -154,6 +154,13 @@ struct FuncGen {
             case Op::Cond: emit_cond(v); break;
             case Op::Loop: emit_loop(v); break;
             case Op::Call: emit_call(v); break;
+            case Op::Load:  // read-only memory load: RAX = *address
+                emit_value(n.ins[0]);
+                a.load(RAX, slot(n.ins[0]));
+                a.mov_from_mem(RAX, RAX);
+                narrow(RAX, n.type);
+                a.store(slot(v), RAX);
+                break;
             default:
                 throw CompileError{std::string("cannot lower op ") + op_name(n.op)};
         }

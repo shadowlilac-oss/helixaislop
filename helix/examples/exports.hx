@@ -11,3 +11,12 @@ fn gcd(a: int, b: int) -> int {
 fn sum_to(n: int) -> int {
     loop (acc = 0, i = 0) { if i > n { break acc } else { next acc + i, i + 1 } }
 }
+
+// Read-only array processing: a[i] is a pure i64 load at a + i*8.
+fn sum_arr(a: ptr, n: int) -> int {
+    loop (acc = 0, i = 0) { if i >= n { break acc } else { next acc + a[i], i + 1 } }
+}
+
+fn dot(a: ptr, b: ptr, n: int) -> int {
+    loop (acc = 0, i = 0) { if i >= n { break acc } else { next acc + a[i] * b[i], i + 1 } }
+}

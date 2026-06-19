@@ -113,6 +113,12 @@ struct Lowerer {
             case Op::Cond: r = lower_cond(v); break;
             case Op::Loop: r = lower_loop(v); break;
             case Op::Call: r = lower_call(v); break;
+            case Op::Load: {
+                VReg addr = lower(n.ins[0]);
+                r = fresh();
+                MInst m; m.op = MOp::Load; m.dst = r; m.a = addr; m.type = n.type; emit(m);
+                break;
+            }
             default: throw CompileError{std::string("cannot lower ") + op_name(n.op)};
         }
         cache[v] = r;
@@ -227,7 +233,7 @@ void operands(const MInst& in, std::vector<VReg>& uses, VReg& def) {
         case MOp::And: case MOp::Or: case MOp::Xor: case MOp::Shl: case MOp::Sar:
         case MOp::Shr: case MOp::SetCmp:
             uses = {in.a, in.b}; def = in.dst; break;
-        case MOp::Neg: case MOp::Not: uses = {in.a}; def = in.dst; break;
+        case MOp::Neg: case MOp::Not: case MOp::Load: uses = {in.a}; def = in.dst; break;
         case MOp::Sel: uses = {in.a, in.b, in.c}; def = in.dst; break;
         case MOp::Call: uses = in.args; def = in.dst; break;
         case MOp::Ret: uses = {in.a}; break;
@@ -448,6 +454,15 @@ struct FnEncoder {
                 get(in.b, RAX); get(in.a, RCX); get(in.c, RDX);
                 a.test_rr(RDX, RDX); a.cmovcc(CC_NE, RAX, RCX); narrow(RAX, in.type); put(in.dst, RAX);
                 break;
+            case MOp::Load: {
+                get(in.a, RAX);            // address into RAX
+                Loc d = loc(in.dst);
+                Reg t = d.inreg ? d.r : RAX;
+                a.mov_from_mem(t, RAX);     // t = *address
+                narrow(t, in.type);
+                if (!d.inreg) a.store(d.disp, t);
+                break;
+            }
             case MOp::Call: encode_call(in); break;
             case MOp::Ret: get(in.a, RAX); epilogue(); break;
             case MOp::Jmp: a.jmp(blk[in.target]); break;

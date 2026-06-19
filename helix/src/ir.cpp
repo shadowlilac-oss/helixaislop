@@ -286,6 +286,11 @@ NodeId World::store(NodeId ptr, NodeId val, NodeId st) {
     return fresh(std::move(n));
 }
 
+NodeId World::pure_load(NodeId ptr, Type t) {
+    Node n{Op::Load, t, {ptr}, NONE, 0, 0};
+    return intern(std::move(n));  // read-only: loads of the same address are the same node
+}
+
 NodeId World::param(Type t, int index, std::string name) {
     Node n{Op::Param, t, {}, NONE, index, 0};
     return fresh(std::move(n), std::move(name));

@@ -14,7 +14,7 @@ enum class Tok {
     End, Ident, Int,
     KwFn, KwComptime, KwLet, KwIf, KwElse, KwLoop, KwBreak, KwNext, KwTrue, KwFalse,
     KwIntTy, KwI64, KwI32, KwBool,
-    LParen, RParen, LBrace, RBrace, Comma, Semi, Colon, Arrow, Assign,
+    LParen, RParen, LBrace, RBrace, LBracket, RBracket, Comma, Semi, Colon, Arrow, Assign,
     Plus, Minus, Star, Slash, Percent,
     Amp, Pipe, Caret, Shl, Shr,
     AndAnd, OrOr, Bang,
@@ -108,6 +108,8 @@ struct Lexer {
             case ')': return {Tok::RParen, ")", 0, ln};
             case '{': return {Tok::LBrace, "{", 0, ln};
             case '}': return {Tok::RBrace, "}", 0, ln};
+            case '[': return {Tok::LBracket, "[", 0, ln};
+            case ']': return {Tok::RBracket, "]", 0, ln};
             case ',': return {Tok::Comma, ",", 0, ln};
             case ';': return {Tok::Semi, ";", 0, ln};
             case ':': return {Tok::Colon, ":", 0, ln};
@@ -168,6 +170,7 @@ struct Parser {
         if (accept(Tok::KwIntTy) || accept(Tok::KwI64)) return ty_i64();
         if (accept(Tok::KwI32)) return ty_i32();
         if (accept(Tok::KwBool)) return ty_bool();
+        if (is(Tok::Ident) && cur().text == "ptr") { p++; return ty_ptr(); }  // ptr = *i64
         err("expected type");
     }
 
@@ -285,7 +288,13 @@ struct Parser {
     NodeId parse_unary() {
         if (accept(Tok::Minus)) return w.neg(parse_unary());
         if (accept(Tok::Bang)) return w.cmp(Op::CmpEq, parse_unary(), w.konst_bool(false));
-        return parse_primary();
+        NodeId v = parse_primary();
+        while (accept(Tok::LBracket)) {  // a[i] = *(a + i*8), a read-only i64 load
+            NodeId idx = parse_expr(0);
+            expect(Tok::RBracket, "]");
+            v = w.pure_load(w.add(v, w.mul(idx, w.konst(8, ty_i64()))), ty_i64());
+        }
+        return v;
     }
 
     NodeId parse_primary() {

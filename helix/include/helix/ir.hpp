@@ -133,6 +133,9 @@ public:
     // effectful ops (state strand)
     NodeId load(NodeId ptr, NodeId st, Type t);
     NodeId store(NodeId ptr, NodeId val, NodeId st);
+    // read-only load (no state token): pure, hash-consed (loads of the same address
+    // CSE). Sound for memory that does not change during the call (e.g. input arrays).
+    NodeId pure_load(NodeId ptr, Type t);
 
     // params and regions
     NodeId param(Type t, int index, std::string name = "");
