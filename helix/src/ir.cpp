@@ -32,6 +32,7 @@ const char* op_name(Op op) {
         case Op::Load: return "load";
         case Op::Store: return "store";
         case Op::Call: return "call";
+        case Op::Proj: return "proj";
         case Op::Func: return "func";
         case Op::Cond: return "cond";
         case Op::Loop: return "loop";
@@ -357,6 +358,25 @@ NodeId World::make_loop(std::vector<NodeId> inits, Type result_type, std::vector
     loops_.push_back(std::move(li));
     Node n{Op::Loop, result_type, std::move(inits), NONE, 0, rid};
     return fresh(std::move(n));
+}
+
+NodeId World::make_loop_multi(std::vector<NodeId> inits, std::vector<NodeId> params, NodeId is_break,
+                              std::vector<NodeId> break_vals, std::vector<NodeId> next_vals) {
+    LoopInfo li;
+    li.params = std::move(params);
+    li.is_break = is_break;
+    li.break_vals = std::move(break_vals);
+    li.next_vals = std::move(next_vals);
+    RegionId rid = (RegionId)loops_.size();
+    loops_.push_back(std::move(li));
+    // A multi-result region node is void-typed; results are read out via proj().
+    Node n{Op::Loop, ty_void(), std::move(inits), NONE, 0, rid};
+    return fresh(std::move(n));
+}
+
+NodeId World::proj(NodeId region, int idx, Type t) {
+    Node n{Op::Proj, t, {region}, NONE, (int64_t)idx, 0};
+    return intern(std::move(n));  // proj(r,k) is structural: same (r,k) -> same node
 }
 
 NodeId World::call(NodeId func, std::vector<NodeId> args, NodeId st) {

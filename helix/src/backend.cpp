@@ -26,6 +26,8 @@ struct FuncGen {
     Asm a;
     std::unordered_map<NodeId, int32_t> slot_;  // node -> [rbp+disp]
     std::unordered_set<NodeId> computed_;
+    std::unordered_set<NodeId> multi_emitted_;                       // multi-result loops emitted
+    std::unordered_map<NodeId, std::vector<int32_t>> loop_result_slots_;  // loop -> result slots
     std::vector<std::pair<size_t, NodeId>> call_relocs;  // (imm offset, target func)
     int slot_count = 0;
     size_t sub_rsp_imm_pos = 0;
@@ -152,7 +154,24 @@ struct FuncGen {
                 break;
             }
             case Op::Cond: emit_cond(v); break;
-            case Op::Loop: emit_loop(v); break;
+            case Op::Loop:
+                if (!w.loop_info(v).break_vals.empty()) {
+                    emit_loop_multi(v);
+                    if (!loop_result_slots_[v].empty()) {
+                        a.load(RAX, loop_result_slots_[v][0]);
+                        a.store(slot(v), RAX);
+                    }
+                } else {
+                    emit_loop(v);
+                }
+                break;
+            case Op::Proj: {
+                NodeId region = n.ins[0];
+                emit_loop_multi(region);
+                a.load(RAX, loop_result_slots_[region][(size_t)n.imm]);
+                a.store(slot(v), RAX);
+                break;
+            }
             case Op::Call: emit_call(v); break;
             case Op::Load:  // read-only memory load: RAX = *address
                 emit_value(n.ins[0]);
@@ -265,6 +284,53 @@ struct FuncGen {
         a.load(RAX, slot(li.break_val));
         a.store(slot(v), RAX);
         computed_.clear();
+    }
+
+    // Multi-result loop: emit once, leaving each break value in its own result slot.
+    void emit_loop_multi(NodeId v) {
+        if (multi_emitted_.count(v)) return;
+        multi_emitted_.insert(v);
+        const Node& n = w.node(v);
+        const LoopInfo& li = w.loop_info(v);
+        const size_t k = li.params.size();
+        for (size_t i = 0; i < k; i++) {
+            emit_value(n.ins[i]);
+            a.load(RAX, slot(n.ins[i]));
+            a.store(slot(li.params[i]), RAX);
+            computed_.insert(li.params[i]);
+        }
+        std::vector<int32_t> temps(k);
+        for (size_t i = 0; i < k; i++) temps[i] = anon_slot();
+
+        Label top = a.new_label(), brk = a.new_label();
+        a.bind(top);
+        computed_.clear();
+        for (size_t i = 0; i < k; i++) computed_.insert(li.params[i]);
+        emit_value(li.is_break);
+        a.load(RAX, slot(li.is_break));
+        a.test_rr(RAX, RAX);
+        a.jcc(CC_NE, brk);
+        for (size_t i = 0; i < k; i++) {
+            emit_value(li.next_vals[i]);
+            a.load(RAX, slot(li.next_vals[i]));
+            a.store(temps[i], RAX);
+        }
+        for (size_t i = 0; i < k; i++) { a.load(RAX, temps[i]); a.store(slot(li.params[i]), RAX); }
+        a.jmp(top);
+
+        a.bind(brk);
+        computed_.clear();
+        for (size_t i = 0; i < k; i++) computed_.insert(li.params[i]);
+        std::vector<int32_t> rslots;
+        for (NodeId bvn : li.break_vals) {
+            emit_value(bvn);
+            a.load(RAX, slot(bvn));
+            int32_t rs = anon_slot();
+            a.store(rs, RAX);
+            rslots.push_back(rs);
+        }
+        computed_.clear();
+        loop_result_slots_[v] = std::move(rslots);
     }
 
     void emit_call(NodeId v) {

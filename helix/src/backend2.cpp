@@ -40,6 +40,7 @@ struct Lowerer {
     int cur = 0;
     std::unordered_map<NodeId, VReg> cache;   // per-block value numbering
     std::unordered_map<NodeId, VReg> params;  // func + loop-carried params (persistent)
+    std::unordered_map<NodeId, std::vector<VReg>> loop_results;  // multi-result loop -> result vregs
 
     Lowerer(World& world, NodeId f) : w(world) {
         const FuncInfo& fi = w.func_info(f);
@@ -111,7 +112,20 @@ struct Lowerer {
                 break;
             }
             case Op::Cond: r = lower_cond(v); break;
-            case Op::Loop: r = lower_loop(v); break;
+            case Op::Loop:
+                if (!w.loop_info(v).break_vals.empty()) {
+                    lower_loop_multi(v);
+                    r = loop_results[v].empty() ? fresh() : loop_results[v][0];
+                } else {
+                    r = lower_loop(v);
+                }
+                break;
+            case Op::Proj: {
+                NodeId region = n.ins[0];
+                lower_loop_multi(region);
+                r = loop_results[region][(size_t)n.imm];
+                break;
+            }
             case Op::Call: r = lower_call(v); break;
             case Op::Load: {
                 VReg addr = lower(n.ins[0]);
@@ -198,6 +212,45 @@ struct Lowerer {
         set_block(ab);
         cache[v] = r;
         return r;
+    }
+
+    // Multi-result loop: emit once, leaving each break value in its own result vreg.
+    void lower_loop_multi(NodeId v) {
+        if (loop_results.count(v)) return;
+        const Node& n = w.node(v);
+        const LoopInfo& li = w.loop_info(v);
+        const int k = (int)li.params.size();
+        std::vector<VReg> cv(k);
+        for (int i = 0; i < k; i++) {
+            VReg iv = lower(n.ins[i]);
+            cv[i] = fresh();
+            emit_mov(cv[i], iv, w.node(li.params[i]).type);
+            params[li.params[i]] = cv[i];
+        }
+        int hb = new_block(), bb = new_block(), xb = new_block(), ab = new_block();
+        emit_jmp(hb);
+        set_block(hb);
+        for (int i = 0; i < k; i++) params[li.params[i]] = cv[i];
+        VReg bv = lower(li.is_break);
+        { MInst br; br.op = MOp::Br; br.a = bv; br.target = xb; br.target2 = bb; emit(br); }
+        set_block(bb);
+        std::vector<VReg> nv(k);
+        for (int i = 0; i < k; i++) nv[i] = lower(li.next_vals[i]);
+        std::vector<VReg> tmp(k);
+        for (int i = 0; i < k; i++) { tmp[i] = fresh(); emit_mov(tmp[i], nv[i], w.node(li.params[i]).type); }
+        for (int i = 0; i < k; i++) emit_mov(cv[i], tmp[i], w.node(li.params[i]).type);
+        emit_jmp(hb);
+        set_block(xb);
+        std::vector<VReg> results;
+        for (NodeId bvn : li.break_vals) {
+            VReg rv = fresh();
+            VReg x = lower(bvn);
+            emit_mov(rv, x, w.node(bvn).type);
+            results.push_back(rv);
+        }
+        emit_jmp(ab);
+        set_block(ab);
+        loop_results[v] = std::move(results);
     }
 
     VReg lower_call(NodeId v) {

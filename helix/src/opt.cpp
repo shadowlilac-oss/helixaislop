@@ -60,12 +60,21 @@ struct Cloner {
                     nps.push_back(np);
                 }
                 NodeId isb = clone(li.is_break, map, depth);
-                NodeId bvl = clone(li.break_val, map, depth);
                 std::vector<NodeId> nxt;
                 for (NodeId nv : li.next_vals) nxt.push_back(clone(nv, map, depth));
-                r = w.make_loop(std::move(inits), n.type, std::move(nps), isb, bvl, std::move(nxt));
+                if (!li.break_vals.empty()) {
+                    std::vector<NodeId> bvs;
+                    for (NodeId bv : li.break_vals) bvs.push_back(clone(bv, map, depth));
+                    r = w.make_loop_multi(std::move(inits), std::move(nps), isb, std::move(bvs), std::move(nxt));
+                } else {
+                    NodeId bvl = clone(li.break_val, map, depth);
+                    r = w.make_loop(std::move(inits), n.type, std::move(nps), isb, bvl, std::move(nxt));
+                }
                 break;
             }
+            case Op::Proj:
+                r = w.proj(clone(n.ins[0], map, depth), (int)n.imm, n.type);
+                break;
             case Op::Call: {
                 std::vector<NodeId> args;
                 for (NodeId a : n.ins) args.push_back(clone(a, map, depth));

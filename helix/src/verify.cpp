@@ -19,7 +19,8 @@ void successors(World& w, NodeId v, std::vector<NodeId>& out) {
         const LoopInfo& li = w.loop_info(v);
         for (NodeId p : li.params) out.push_back(p);
         out.push_back(li.is_break);
-        out.push_back(li.break_val);
+        if (li.break_val != NONE) out.push_back(li.break_val);
+        for (NodeId bv : li.break_vals) out.push_back(bv);
         for (NodeId nv : li.next_vals) out.push_back(nv);
     }
 }

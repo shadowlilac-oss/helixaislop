@@ -48,6 +48,7 @@ enum class Op : uint16_t {
     Select,
     // effectful (carry a state edge)
     Load, Store, Call,
+    Proj,  // proj(region, idx): the idx-th result of a multi-result region
     // region / nominal nodes
     Func, Cond, Loop, Module,
     LAST
@@ -90,7 +91,8 @@ struct LoopInfo {
     // Tail-controlled loop expressed without a graph cycle.
     std::vector<NodeId> params;     // carried block parameters
     NodeId is_break = NONE;         // bool: stop iterating this round?
-    NodeId break_val = NONE;        // value produced on break
+    NodeId break_val = NONE;        // single-result loops: value produced on break
+    std::vector<NodeId> break_vals; // multi-result loops: values on break (empty => single)
     std::vector<NodeId> next_vals;  // carried values when continuing
 };
 
@@ -154,7 +156,13 @@ public:
     // loops
     NodeId make_loop(std::vector<NodeId> inits, Type result_type, std::vector<NodeId> params,
                      NodeId is_break, NodeId break_val, std::vector<NodeId> next_vals);
+    // Multi-result loop: produces break_vals.size() results, each accessed via proj().
+    NodeId make_loop_multi(std::vector<NodeId> inits, std::vector<NodeId> params, NodeId is_break,
+                           std::vector<NodeId> break_vals, std::vector<NodeId> next_vals);
     const LoopInfo& loop_info(NodeId l) const { return loops_[node(l).region]; }
+
+    // Project the idx-th result of a multi-result region (Loop).
+    NodeId proj(NodeId region, int idx, Type t);
 
     // calls (direct call of a Func node)
     NodeId call(NodeId func, std::vector<NodeId> args, NodeId st = NONE);

@@ -16,6 +16,7 @@ struct Interp {
     struct Frame {
         std::unordered_map<NodeId, int64_t> bind;  // Param -> value (incl. loop carried)
         std::unordered_map<NodeId, int64_t> memo;  // pure-node cache (valid while bind fixed)
+        std::unordered_map<NodeId, std::vector<int64_t>> loop_multi;  // multi-result loop cache
     };
 
     bool spend() {
@@ -91,6 +92,18 @@ struct Interp {
                 result = *reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(addr));
                 break;
             }
+            case Op::Proj: {  // idx-th result of a multi-result loop (run once, cached)
+                NodeId region = n.ins[0];
+                int k = (int)n.imm;
+                auto it = fr.loop_multi.find(region);
+                if (it == fr.loop_multi.end()) {
+                    std::vector<int64_t> res = eval_loop_multi(region, fr);
+                    if (out_of_fuel) return 0;
+                    it = fr.loop_multi.emplace(region, std::move(res)).first;
+                }
+                result = (k >= 0 && k < (int)it->second.size()) ? it->second[(size_t)k] : 0;
+                break;
+            }
             default:
                 result = 0;
                 break;
@@ -113,6 +126,7 @@ struct Interp {
             if (!spend()) return 0;
             for (size_t k = 0; k < li.params.size(); k++) fr.bind[li.params[k]] = cur[k];
             fr.memo.clear();  // carried values changed -> invalidate pure cache
+            fr.loop_multi.clear();
 
             int64_t brk = eval(li.is_break, fr);
             if (out_of_fuel) return 0;
@@ -122,6 +136,34 @@ struct Interp {
             nxt.reserve(li.next_vals.size());
             for (NodeId nv : li.next_vals) nxt.push_back(eval(nv, fr));
             if (out_of_fuel) return 0;
+            cur = std::move(nxt);
+        }
+    }
+
+    std::vector<int64_t> eval_loop_multi(NodeId id, Frame& fr) {
+        const Node& n = w.node(id);
+        const LoopInfo& li = w.loop_info(id);
+        std::vector<int64_t> cur;
+        cur.reserve(n.ins.size());
+        for (NodeId init : n.ins) cur.push_back(eval(init, fr));
+        if (out_of_fuel) return {};
+        for (;;) {
+            if (!spend()) return {};
+            for (size_t k = 0; k < li.params.size(); k++) fr.bind[li.params[k]] = cur[k];
+            fr.memo.clear();
+            fr.loop_multi.clear();
+            int64_t brk = eval(li.is_break, fr);
+            if (out_of_fuel) return {};
+            if (brk) {
+                std::vector<int64_t> res;
+                res.reserve(li.break_vals.size());
+                for (NodeId bv : li.break_vals) res.push_back(eval(bv, fr));
+                return res;
+            }
+            std::vector<int64_t> nxt;
+            nxt.reserve(li.next_vals.size());
+            for (NodeId nv : li.next_vals) nxt.push_back(eval(nv, fr));
+            if (out_of_fuel) return {};
             cur = std::move(nxt);
         }
     }
