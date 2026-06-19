@@ -46,7 +46,7 @@ validated by differential testing against it.
 
 ## Validation evidence
 
-- **55 unit/integration tests, ~18,800 assertions** — `./build.ps1`.
+- **57 unit/integration tests, ~18,900 assertions** — `./build.ps1`.
 - **~5,400** randomized differential checks for the optimizing backend (`jit_ra == interp == C++ ref`).
 - **405,651** randomized control-flow differential checks (nested if/loops/recursion/calls), **0 mismatches**.
 - **Native end-to-end**: `helixc --emit-obj` → `link.exe` → a real `.exe` that runs
@@ -57,8 +57,9 @@ validated by differential testing against it.
 
 ## What is NOT built yet (honest)
 
-- Memory/array ops in codegen (modeled + verified in the IR, not lowered).
-- Mutable variables / `while` / arrays in the surface language (functional core only).
+- Memory **writes** / state-threaded effects (read-only array `a[i]` loads *are* lowered
+  to native code in both backends and validated on real memory; stores are not yet emitted).
+- Mutable variables / `while` in the surface language (functional core + array indexing only).
 - Single target (x86-64 Win64), ≤4 params, no register coalescing / live-range splitting.
 - The full Tier-2 equality overlay and SMT-verified rule DSL (the design's optional
   pieces) are described but not implemented; the shipped optimizer is Tier-1 + structural.

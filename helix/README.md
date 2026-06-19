@@ -21,9 +21,10 @@ Every backend is validated by **differential testing**: for thousands of program
 and inputs, `jit(f)(args)` must equal `interp(f)(args)`. This makes even the
 aggressive register allocator safe — any miscompile shows up as a mismatch.
 
-- **55 unit/integration tests, ~18,800 assertions** (`./build.ps1`)
+- **57 unit/integration tests, ~18,900 assertions** (`./build.ps1`)
 - **~5,400** randomized differential checks for the optimizing backend
 - **405,651** randomized control-flow differential checks (separate fuzzer), 0 mismatches
+- array reductions validated against the interpreter on **real memory** (both backends)
 - **native link + run** of an emitted `.obj` is part of the suite (end-to-end)
 
 ## What works (and is tested)
@@ -40,6 +41,7 @@ aggressive register allocator safe — any miscompile shows up as a mismatch.
 | Simple backend: memory-backed codegen (oracle baseline) | ✅ | `src/backend.cpp` |
 | **Optimizing backend**: VCode → liveness → **linear-scan register allocation** (callee-saved homes, stack spills) → x86-64 | ✅ | `src/backend2.cpp`, `include/helix/vcode.hpp` |
 | **Middle-end opt passes**: function inlining, dead-function reachability | ✅ | `src/opt.cpp` |
+| Read-only **array memory** (`a[i]` pure loads, CSE'd) lowered to native loads | ✅ | `src/front.cpp`, both backends |
 | **COFF object emission** → link with `link.exe` → native `.exe` | ✅ | `src/coff.cpp`, `src/backend2.cpp` |
 | Independent x86-64 **disassembler** (second check on the encoder) | ✅ | `src/disasm.cpp` |
 
@@ -91,16 +93,19 @@ comptime fn fact(n: int) -> int {      // evaluated at compile time, folds to a 
 
 ## Out of scope / known limitations (honest)
 
-- **Memory effects in codegen.** `load`/`store`/`call`-with-state are modeled in the
-  IR and checked by the verifier, but the backends currently lower the **pure +
-  control + call** subset (no array/memory ops in generated code yet).
-- **Surface language is functional** (immutable bindings + `loop`/`break`/`next`);
-  no mutable variables / `while` / arrays yet. (Loop-carried values give iteration.)
+- **Memory writes.** Read-only array loads (`a[i]`) are lowered to native code; *stores*
+  and state-threaded effects (which need state ordering through loops) are modeled +
+  verified in the IR but not yet emitted.
+- **Surface language is functional** (immutable bindings + `loop`/`break`/`next` + array
+  indexing); no mutable variables / `while` yet. (Loop-carried values give iteration.)
 - **`idiv` edge cases** (`x/0`, `INT64_MIN/-1`) are defined to match the interpreter
   (`0` / `INT64_MIN`) via guards rather than trapping.
 - Single target (**x86-64, Win64 ABI**), `≤ 4` parameters/args per function.
-- The register allocator is **linear-scan without live-range splitting**; correct and
-  fast-compiling, not yet optimal (no coalescing of the load/op/store scratch moves).
+- The register allocator is **linear-scan without live-range splitting or coalescing**.
+  With direct two-address codegen it runs **~1.37× faster** than the simple backend on
+  register-pressure code and **~1.07×** on loops, but is modestly *slower* on deep
+  recursion (callee-saved save/restore overhead the all-memory backend avoids) — a known
+  register-allocation tradeoff. Coalescing / shrink-wrapping would close that gap.
 
 ## Source layout
 
@@ -109,7 +114,7 @@ include/helix/   ir, eval, front, verify, print, x64, vcode, backend, opt, coff,
 src/             ir, eval, front, verify, print, backend (simple), backend2 (optimizing),
                  opt, coff, disasm
 tests/           test framework + test_{ir,eval,front,backend,backend_ra,verify,opt,
-                 components,regress,fuzz}.cpp
+                 memory,components,regress,fuzz}.cpp
 tools/helixc.cpp the CLI driver (--run / --print / --emit-obj / --simple)
 examples/        demo.hx, exports.hx, driver.c
 build.ps1        MSVC build + test runner
