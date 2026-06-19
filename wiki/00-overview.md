@@ -151,10 +151,11 @@ Read top to bottom for the full argument; jump by interest using the description
 24. [24 — Implementation Status](24-implementation-status.md) — the **working C++ implementation**: design↔code map, validation evidence, honest gaps.
 
 > **There is a working implementation.** Helix is not only a design: the [`helix/`](../helix/) tree is a
-> dependency-free C++20 compiler that parses to the graph, optimizes, register-allocates,
-> and emits native x86-64 (JIT or COFF `.obj` → `.exe`), validated against an interpreter
-> oracle (55 tests / ~18.8k assertions + ~411k randomized differential checks). See
-> [Implementation Status](24-implementation-status.md).
+> dependency-free C++20 compiler for a small imperative language (mutable vars, `while`, recursion,
+> read/write arrays, comptime) that parses to the graph, optimizes, register-allocates, and emits
+> native x86-64 (JIT or COFF `.obj` → `.exe`) — it compiles a bubble sort to a native object that
+> sorts a real C array. Validated against an interpreter oracle (68 tests / ~21.2k assertions +
+> ~750k randomized differential checks). See [Implementation Status](24-implementation-status.md).
 
 ---
 
