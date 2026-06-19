@@ -3,12 +3,17 @@
 A from-scratch, dependency-free **C++20** implementation of the Helix compiler IR
 designed in [`../wiki`](../wiki). It is a real, end-to-end **optimizing** compiler
 for a small **imperative** language (mutable variables, `while`, `if`, recursion,
-read/write arrays): it **parses source directly into the graph, normalizes and
+read-only arrays): it **parses source directly into the graph, normalizes and
 evaluates compile-time code as graph reduction, optimizes (GVN/fold/CSE +
 inlining + DCE), register-allocates, and emits real x86-64** — either JIT-executed
 or written to a **COFF object file** that `link.exe` turns into a native `.exe`.
-No secondary IR at either end. It compiles an imperative **bubble sort** to a native
-object that sorts a real C array in place.
+No secondary IR at either end.
+
+> Array **writes** were prototyped (a bubble sort ran natively) but a differential
+> fuzzer found ordering miscompiles in the threaded-state effect lowering, so writes
+> are **disabled** pending a correct region-port effect implementation (see the
+> [effects design](../wiki/13-types-and-effects.md)). Correctness over features — the
+> shipped compiler has no known miscompiles.
 
 > **Honest scope.** This is a rigorously-tested compiler over a small (but
 > Turing-complete) integer language, not a finished production toolchain (matching
@@ -23,12 +28,14 @@ Every backend is validated by **differential testing**: for thousands of program
 and inputs, `jit(f)(args)` must equal `interp(f)(args)`. This makes even the
 aggressive register allocator safe — any miscompile shows up as a mismatch.
 
-- **68 unit/integration tests, ~21,200 assertions** (`./build.ps1`)
+- **66 unit/integration tests, ~21,300 assertions** (`./build.ps1`)
 - **~5,400** randomized differential checks for the optimizing backend
 - **405,651** randomized control-flow differential checks (separate fuzzer), 0 mismatches
-- **336,000** randomized memory/array differential checks (3-way), 0 mismatches
-- in-place algorithms (bubble sort, reverse, prefix-sums) validated **interp == simple == ra** on real arrays
-- **native link + run** of an emitted `.obj` is part of the suite (incl. native bubble sort)
+- **336,000** randomized memory/array-read differential checks (3-way), 0 mismatches
+- imperative + array-read programs validated **interp == simple == ra** on real arrays
+- **native link + run** of an emitted `.obj` is part of the suite (end-to-end)
+- a differential fuzzer is how the array-write miscompiles were caught — *that* is the
+  bar this project holds itself to
 
 ## What works (and is tested)
 
@@ -46,7 +53,7 @@ aggressive register allocator safe — any miscompile shows up as a mismatch.
 | **Middle-end opt passes**: function inlining, dead-function reachability | ✅ | `src/opt.cpp` |
 | **Imperative frontend**: mutable `var`, assignment, `while`, statement-`if` (on-the-fly SSA) | ✅ | `src/front.cpp` |
 | **Multi-result loop regions** + `Proj` (so `while` can output several vars) | ✅ | `src/ir.cpp`, both backends |
-| **Array memory**: read `a[i]` (pure, CSE'd) and write `a[i]=v` (threaded state) | ✅ | `src/front.cpp`, both backends |
+| **Read-only array memory** (`a[i]` pure loads, CSE'd) lowered to native loads | ✅ | `src/front.cpp`, both backends |
 | **COFF object emission** → link with `link.exe` → native `.exe` | ✅ | `src/coff.cpp`, `src/backend2.cpp` |
 | Independent x86-64 **disassembler** (second check on the encoder) | ✅ | `src/disasm.cpp` |
 
@@ -82,17 +89,10 @@ comptime fn fact(n: int) -> int {       // evaluated at compile time, folds to a
     loop (acc = 1, i = 1) { if i > n { break acc } else { next acc*i, i+1 } }
 }
 
-fn bubble(a: ptr, n: int) -> int {      // imperative: mutable vars, while, array writes
-    var i = 0;
-    while i < n {
-        var j = 0;
-        while j < n - 1 {
-            if a[j] > a[j + 1] { var t = a[j]; a[j] = a[j + 1]; a[j + 1] = t; }
-            j = j + 1;
-        }
-        i = i + 1;
-    }
-    return 0;
+fn amax(a: ptr, n: int) -> int {        // imperative: mutable vars, while, statement-if, array reads
+    var m = a[0]; var i = 1;
+    while i < n { if a[i] > m { m = a[i]; } i = i + 1; }
+    return m;
 }
 ```
 
@@ -109,10 +109,14 @@ fn bubble(a: ptr, n: int) -> int {      // imperative: mutable vars, while, arra
 
 ## Out of scope / known limitations (honest)
 
-- **Effect granularity.** Memory uses a single threaded state token (a total order of
-  writes — correct but conservative); no fine-grained alias-class states or
-  store-to-load forwarding yet. Read-only loads are CSE'd; effectful loads (inside
-  write-containing functions) are not.
+- **Array writes are disabled.** The prototype threaded a memory state through the graph,
+  but a differential fuzzer found the effect *lowering* misorders/duplicates stores in
+  certain read-after-conditional-store patterns. A correct fix needs state threaded through
+  region **ports** (the RVSDG approach in [`wiki/13`](../wiki/13-types-and-effects.md)), not
+  as free variables in branches — that is the next real piece of work. Reads work.
+- **Interpreter recursion depth.** The reference interpreter is recursive; pathologically
+  deep recursion/nesting can overflow the C++ stack before the fuel limit trips (a fuzzer
+  edge case, not hit by normal programs). The JITs are unaffected.
 - The surface language is small (i64-centric, `≤ 4` params); no structs, function
   pointers, or strings.
 - **`idiv` edge cases** (`x/0`, `INT64_MIN/-1`) are defined to match the interpreter
@@ -131,7 +135,7 @@ include/helix/   ir, eval, front, verify, print, x64, vcode, backend, opt, coff,
 src/             ir, eval, front, verify, print, backend (simple), backend2 (optimizing),
                  opt, coff, disasm
 tests/           test framework + test_{ir,eval,front,backend,backend_ra,verify,opt,
-                 memory,imperative,writes,multiresult,components,regress,fuzz}.cpp
+                 memory,imperative,multiresult,components,regress,fuzz}.cpp
 tools/helixc.cpp the CLI driver (--run / --print / --emit-obj / --simple)
 examples/        demo.hx, exports.hx, driver.c
 build.ps1        MSVC build + test runner

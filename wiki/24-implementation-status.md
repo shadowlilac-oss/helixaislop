@@ -46,7 +46,7 @@ validated by differential testing against it.
 
 ## Validation evidence
 
-- **68 unit/integration tests, ~21,200 assertions** — `./build.ps1`.
+- **66 unit/integration tests, ~21,300 assertions** — `./build.ps1`.
 - **~5,400** randomized differential checks for the optimizing backend (`jit_ra == interp == C++ ref`).
 - **405,651** randomized control-flow differential checks (nested if/loops/recursion/calls), **0 mismatches**.
 - **Native end-to-end**: `helixc --emit-obj` → `link.exe` → a real `.exe` that runs
@@ -57,10 +57,11 @@ validated by differential testing against it.
 
 ## What is NOT built yet (honest)
 
-- Fine-grained effects: memory uses a single total-order state token (correct but
-  conservative — no alias-class states or store-to-load forwarding). Array reads AND
-  writes (`a[i]`, `a[i]=v`), mutable `var`/`while`/statement-`if`, and multi-result
-  loops ARE implemented and validated (interp == both backends; native bubble sort).
+- Array **writes**: prototyped (a bubble sort ran natively) but a differential fuzzer
+  found ordering miscompiles in the threaded-state effect *lowering*, so writes are
+  disabled pending state threaded through region **ports** (DC4 / `13-types-and-effects.md`)
+  rather than as branch-free-variables. Array **reads**, mutable `var`/`while`/statement-`if`,
+  and multi-result loops ARE implemented and validated (interp == both backends).
 - Single target (x86-64 Win64), ≤4 params, no register coalescing / live-range splitting.
 - The full Tier-2 equality overlay and SMT-verified rule DSL (the design's optional
   pieces) are described but not implemented; the shipped optimizer is Tier-1 + structural.
